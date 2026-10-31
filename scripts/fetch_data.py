@@ -10,8 +10,10 @@ Reads data/tickers.json and writes data/market.json with, per ticker:
 Standard library only. Every source is optional: if one fails for a ticker,
 the previous day's value is kept and the error is recorded.
 """
+import gzip
 import json
 import os
+import urllib.error
 import re
 import sys
 import time
@@ -27,22 +29,39 @@ OUT_FILE = os.path.join(ROOT, "data", "market.json")
 
 # SEC asks every client to identify itself with a contact. Set the
 # SEC_USER_AGENT repository variable to e.g. "Stock Journal you@example.com".
-SEC_UA = os.environ.get("SEC_USER_AGENT") or "StockJournal max-stax@users.noreply.github.com"
+SEC_UA = os.environ.get("SEC_USER_AGENT") or "Stock Journal research max-stax@users.noreply.github.com"
 WEB_UA = "Mozilla/5.0 (compatible; StockJournal/1.0)"
 
 
 # ---------------------------------------------------------------- http
 
-def get(url, ua=WEB_UA, timeout=20, tries=2):
+def get(url, ua=WEB_UA, timeout=20, tries=3, headers=None):
     last = None
     for i in range(tries):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept-Encoding": "identity"})
+            h = {"User-Agent": ua, "Accept-Encoding": "gzip, deflate", "Accept": "*/*"}
+            h.update(headers or {})
+            req = urllib.request.Request(url, headers=h)
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.read()
+                body = r.read()
+                if r.headers.get("Content-Encoding") == "gzip" or body[:2] == b"\x1f\x8b":
+                    body = gzip.decompress(body)
+                return body
+        except urllib.error.HTTPError as e:
+            snippet = ""
+            try:
+                raw = e.read()
+                if raw[:2] == b"\x1f\x8b":
+                    raw = gzip.decompress(raw)
+                snippet = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw.decode("utf-8", "replace")))[:160]
+            except Exception:  # noqa: BLE001
+                pass
+            last = RuntimeError(f"HTTP {e.code} from {urllib.parse.urlsplit(url).netloc}: {snippet}".strip())
+            if e.code in (401, 403, 404):
+                break
         except Exception as e:  # noqa: BLE001
-            last = e
-            time.sleep(1.5 * (i + 1))
+            last = RuntimeError(f"{type(e).__name__}: {e}")
+        time.sleep(2 * (i + 1))
     raise last
 
 
@@ -542,8 +561,25 @@ def flag_and_strengths(f):
 
 
 def sec_ticker_map():
-    raw = get_json("https://www.sec.gov/files/company_tickers.json", SEC_UA)
-    return {v["ticker"].upper(): (str(v["cik_str"]).zfill(10), v["title"]) for v in raw.values()}
+    """ticker -> (10-digit CIK, company name). Tries SEC's JSON list, then its plain-text list."""
+    errs = []
+    try:
+        raw = get_json("https://www.sec.gov/files/company_tickers.json", SEC_UA)
+        return {v["ticker"].upper(): (str(v["cik_str"]).zfill(10), v["title"]) for v in raw.values()}, None
+    except Exception as e:  # noqa: BLE001
+        errs.append(f"company_tickers.json: {e}")
+    try:
+        txt = get("https://www.sec.gov/include/ticker.txt", SEC_UA).decode()
+        m = {}
+        for line in txt.splitlines():
+            t, _, c = line.partition("\t")
+            if t and c.strip().isdigit():
+                m[t.upper()] = (c.strip().zfill(10), None)
+        if m:
+            return m, None
+    except Exception as e:  # noqa: BLE001
+        errs.append(f"ticker.txt: {e}")
+    return {}, "; ".join(errs)
 
 
 def sec_facts(cik):
@@ -618,17 +654,20 @@ def main():
     except Exception:  # noqa: BLE001
         old = {}
 
-    try:
-        tmap = sec_ticker_map()
-    except Exception as e:  # noqa: BLE001
-        print("SEC ticker map failed:", e, file=sys.stderr)
-        tmap = {}
+    # CIKs never change, so remember the ones we've already resolved
+    known = {s: (r.get("cik"), r.get("name")) for s, r in old.items() if r.get("cik")}
+    tmap, sec_err = sec_ticker_map()
+    if sec_err:
+        print("SEC ticker list failed:", sec_err, file=sys.stderr)
+    meta = {"secTickerList": "ok" if tmap else sec_err}
 
     out = {}
     for sym in tickers:
         prev = old.get(sym, {})
         rec = {"symbol": sym, "errors": {}}
-        cik, title = tmap.get(sym, (prev.get("cik"), prev.get("name")))
+        cik, title = tmap.get(sym) or known.get(sym) or (None, None)
+        if tmap.get(sym) and not tmap[sym][1]:
+            title = (known.get(sym) or (None, None))[1]
         rec["cik"], rec["name"] = cik, title
 
         price, err = fetch_price(sym)
@@ -643,11 +682,13 @@ def main():
                     rec["errors"]["fundamentals"] = "No annual financials in SEC filings yet"
             except Exception as e:  # noqa: BLE001
                 rec["fundamentals"] = prev.get("fundamentals")
-                rec["errors"]["fundamentals"] = str(e)
-            time.sleep(0.2)
+                rec["errors"]["fundamentals"] = f"SEC filings request failed: {e}"
+                print(f"{sym} SEC facts failed: {e}", file=sys.stderr)
+            time.sleep(0.25)
         else:
-            rec["fundamentals"] = None
-            rec["errors"]["fundamentals"] = "Not in SEC company list (ETF, fund, or foreign listing)"
+            rec["fundamentals"] = prev.get("fundamentals")
+            rec["errors"]["fundamentals"] = ("Not in SEC company list (ETF, fund, or foreign listing)" if tmap
+                                             else f"Couldn't load SEC company list: {sec_err}")
 
         news, err = fetch_news(sym, title)
         rec["news"] = news or prev.get("news", [])
@@ -660,7 +701,7 @@ def main():
               f"fund={'ok' if rec.get('fundamentals') else 'none'} news={len(rec['news'])}")
 
     with open(OUT_FILE, "w") as fh:
-        json.dump({"generated": datetime.now(timezone.utc).isoformat(timespec="seconds"), "tickers": out},
+        json.dump({"generated": datetime.now(timezone.utc).isoformat(timespec="seconds"), "meta": meta, "tickers": out},
                   fh, separators=(",", ":"))
 
 
