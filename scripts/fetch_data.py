@@ -109,7 +109,7 @@ def get(url, ua=BROWSER_UA, timeout=12, tries=2, opener=None):
             except Exception:  # noqa: BLE001
                 pass
             last = RuntimeError(f"HTTP {e.code} from {urllib.parse.urlsplit(url).netloc} {snippet}".strip())
-            if e.code in (400, 401, 403, 404):
+            if e.code in (400, 401, 402, 403, 404, 429):
                 break
         except Exception as e:  # noqa: BLE001
             last = RuntimeError(f"{type(e).__name__}: {e}")
@@ -187,6 +187,27 @@ class Yahoo:
 YH = Yahoo()
 
 
+# ---------------------------------------------------------------- Financial Modeling Prep (free key)
+
+FMP_KEY = os.environ.get("FMP_API_KEY", "").strip()
+
+
+def fmp(path, **params):
+    params["apikey"] = FMP_KEY
+    data = get_json(f"https://financialmodelingprep.com/stable/{path}?" + urllib.parse.urlencode(params))
+    if isinstance(data, dict) and (data.get("Error Message") or data.get("error")):
+        raise RuntimeError(f"FMP {path}: {data.get('Error Message') or data.get('error')}")
+    return data if isinstance(data, list) else []
+
+
+def _f(r, *keys):
+    for k in keys:
+        if r.get(k) is not None:
+            return r[k]
+    return None
+
+
+
 # ================================================================ prices
 
 def price_yahoo(sym):
@@ -254,9 +275,19 @@ def build_price(hist, last=None, currency="USD"):
     }
 
 
+def price_fmp(sym):
+    start = (date.today() - timedelta(days=5 * 365 + 10)).isoformat()
+    rows = fmp("historical-price-eod/full", symbol=sym, **{"from": start})
+    if isinstance(rows, dict):
+        rows = rows.get("historical", [])
+    hist = sorted((r["date"], float(r.get("adjClose") or r["close"]), float(r.get("volume") or 0))
+                  for r in rows if r.get("close") is not None)
+    return build_price(hist, None, "USD")
+
+
 def fetch_price(sym):
     errors = []
-    for fn in (price_yahoo, price_stooq):
+    for fn in ((price_fmp,) if FMP_KEY else ()) + (price_yahoo, price_stooq):
         try:
             return fn(sym), None
         except Exception as e:  # noqa: BLE001
@@ -611,26 +642,6 @@ def from_yahoo(sym):
             break
     return {"source": "Yahoo Finance (from company filings)", "currency": currency or "USD", "fy": fy, "ttm": ttm,
             "growth": growth, "bal": bal, "quarters": quarters, "shares": shares}
-
-
-# ---------------------------------------------------------------- Financial Modeling Prep (free key)
-
-FMP_KEY = os.environ.get("FMP_API_KEY", "").strip()
-
-
-def fmp(path, **params):
-    params["apikey"] = FMP_KEY
-    data = get_json(f"https://financialmodelingprep.com/stable/{path}?" + urllib.parse.urlencode(params))
-    if isinstance(data, dict) and (data.get("Error Message") or data.get("error")):
-        raise RuntimeError(f"FMP {path}: {data.get('Error Message') or data.get('error')}")
-    return data if isinstance(data, list) else []
-
-
-def _f(r, *keys):
-    for k in keys:
-        if r.get(k) is not None:
-            return r[k]
-    return None
 
 
 def from_fmp(sym):
@@ -1137,6 +1148,13 @@ def main():
             name = name or price.pop("_name", None)
             qtype = price.pop("_type", None) or qtype
             price.pop("_name", None)
+        if FMP_KEY and (not name or not qtype):
+            try:
+                prof = (fmp("profile", symbol=sym) or [{}])[0]
+                name = name or prof.get("companyName")
+                qtype = qtype or ("ETF" if prof.get("isEtf") else "MUTUALFUND" if prof.get("isFund") else "EQUITY")
+            except Exception as e:  # noqa: BLE001
+                print(f"{sym} FMP profile failed: {e}", file=sys.stderr)
         rec.update({"cik": cik, "name": name, "quoteType": qtype})
         rec["price"] = price or prev.get("price")
         if err and not price:
