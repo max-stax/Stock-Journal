@@ -706,6 +706,125 @@ def from_fmp(sym):
             "growth": growth, "bal": bal_map, "quarters": quarters, "shares": shares}
 
 
+# ---------------------------------------------------------------- Finnhub (free key): as-reported SEC financials
+
+FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
+
+
+def finnhub(path, **params):
+    params["token"] = FINNHUB_KEY
+    time.sleep(1.1)  # free plan: ~60 calls/minute
+    data = get_json(f"https://finnhub.io/api/v1/{path}?" + urllib.parse.urlencode(params))
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(f"Finnhub {path}: {data['error']}")
+    return data
+
+
+def _fh_items(report):
+    """{concept-without-taxonomy: value} for one statement list."""
+    out = {}
+    for it in report or []:
+        c = str(it.get("concept", "")).split("_", 1)[-1].split(":")[-1]
+        v = it.get("value")
+        if c and isinstance(v, (int, float)) and c not in out:
+            out[c] = v
+    return out
+
+
+def _pick(items, cands):
+    for _, concept in cands:
+        if concept in items:
+            return items[concept]
+    return None
+
+
+def _fh_balance(bs):
+    g = lambda k: _pick(bs, SEC_INST[k])  # noqa: E731
+    lt, st = g("ltDebt"), g("stDebt")
+    gw, oi = g("goodwill"), g("otherIntangibles")
+    ta, eq, tl = g("totalAssets"), g("equity"), g("totalLiabilities")
+    if tl is None and ta is not None and eq is not None:
+        tl = ta - eq
+    return {"cash": g("cash"), "sti": g("sti"), "totalDebt": None if lt is None and st is None else (lt or 0) + (st or 0),
+            "equity": eq, "currentAssets": g("currentAssets"), "currentLiabilities": g("currentLiabilities"),
+            "totalAssets": ta, "totalLiabilities": tl,
+            "intangibles": (gw or 0) + (oi or 0) if (gw is not None or oi is not None or ta is not None) else None}
+
+
+def _fh_flow(ic, cf):
+    g = lambda d, k: _pick(d, SEC_DUR[k])  # noqa: E731
+    rev, gp, cor = g(ic, "revenue"), g(ic, "grossProfit"), g(ic, "costOfRevenue")
+    if gp is None and rev is not None and cor is not None:
+        gp = rev - cor
+    capex = g(cf, "capex")
+    return {"revenue": rev, "grossProfit": gp, "operatingIncome": g(ic, "operatingIncome"),
+            "netIncome": g(ic, "netIncome"), "operatingCashFlow": g(cf, "operatingCashFlow"),
+            "capex": abs(capex) if capex is not None else None, "sbc": g(cf, "sbc"), "eps": g(ic, "eps"),
+            "dilutedShares": g(ic, "dilutedShares")}
+
+
+def from_finnhub(sym):
+    ann = finnhub("stock/financials-reported", symbol=sym, freq="annual").get("data") or []
+    ann = [a for a in ann if a.get("endDate")]
+    if not ann:
+        return None
+    rows = {}
+    for a in sorted(ann, key=lambda a: a.get("filedDate") or ""):  # later filings (amendments) win
+        end = a["endDate"][:10]
+        r = a.get("report") or {}
+        bs, ic, cf = _fh_items(r.get("bs")), _fh_items(r.get("ic")), _fh_items(r.get("cf"))
+        rows[end] = {"end": end, **_fh_flow(ic, cf), **_fh_balance(bs)}
+    ends = sorted(rows)[-5:]
+    fy = [rows[e] for e in ends]
+    bal = {e: {k: rows[e][k] for k in BAL_KEYS} for e in ends}
+    ttm = {k: fy[-1].get(k) for k in ("revenue", "grossProfit", "operatingIncome", "netIncome",
+                                      "operatingCashFlow", "capex", "sbc", "eps")}
+    ttm["asOf"], quarters, growth = ends[-1], [], None
+    try:
+        qd = finnhub("stock/financials-reported", symbol=sym, freq="quarterly").get("data") or []
+        qmap = {}
+        for q in sorted(qd, key=lambda q: q.get("filedDate") or ""):
+            if not q.get("endDate"):
+                continue
+            end = q["endDate"][:10]
+            r = q.get("report") or {}
+            ic, bs = _fh_items(r.get("ic")), _fh_items(r.get("bs"))
+            f = _fh_flow(ic, {})
+            qmap[end] = {"end": end, "revenue": f["revenue"], "eps": f["eps"], "netIncome": f["netIncome"],
+                         "_ic": f}
+            if bs:
+                bal[end] = _fh_balance(bs)
+        # Annual 10-K rows hold full-year figures; derive Q4 as FY minus the three reported quarters
+        for e in ends:
+            if e in qmap:
+                continue
+            prior = [qmap[d] for d in sorted(qmap) if 0 < _days(d, e) < 300][-3:]
+            if len(prior) == 3:
+                q4 = {"end": e}
+                for k in ("revenue", "eps", "netIncome"):
+                    vals = [p[k] for p in prior]
+                    q4[k] = rows[e][k] - sum(vals) if rows[e].get(k) is not None and None not in vals else None
+                q4["_ic"] = {k: q4.get(k) for k in ("revenue", "eps", "netIncome")}
+                qmap[e] = q4
+        qs = sorted(qmap)[-9:]
+        quarters = [{k: qmap[d][k] for k in ("end", "revenue", "eps", "netIncome")} for d in qs]
+        last4 = qs[-4:]
+        if len(last4) == 4 and _days(last4[0], last4[-1]) < 300 and last4[-1] > ends[-1]:
+            for k in ("revenue", "netIncome", "eps"):
+                vals = [qmap[d][k] for d in last4]
+                if None not in vals:
+                    ttm[k] = sum(vals)
+            ttm["asOf"] = last4[-1]
+        if len(quarters) >= 5:
+            ya = next((x for x in reversed(quarters[:-1]) if 355 <= _days(x["end"], quarters[-1]["end"]) <= 375), None)
+            if ya and ya.get("revenue"):
+                growth = pct(quarters[-1]["revenue"], ya["revenue"])
+    except Exception as e:  # noqa: BLE001
+        print(f"{sym}: Finnhub quarterly unavailable ({e}); annual only", file=sys.stderr)
+    return {"source": "Finnhub (as reported to the SEC)", "currency": "USD", "fy": fy, "ttm": ttm, "growth": growth,
+            "bal": bal, "quarters": quarters, "shares": fy[-1].get("dilutedShares")}
+
+
 # ================================================================ analysis
 
 def derive_balance(b, revenue=None):
@@ -947,6 +1066,59 @@ def flags(f):
 
 # ================================================================ CAN SLIM
 
+def chart_pattern(p):
+    """Classify the last ~6 months: sideways / sideways-slightly-up (good) vs straight up / straight down."""
+    if not p or p.get("ret6m") is None or not p.get("ma200"):
+        return None, None, "Not enough price history."
+    r6, d200 = p["ret6m"], (p["last"] / p["ma200"] - 1) * 100
+    desc = f"6-month change {r6:+.0f}%, price {d200:+.0f}% vs its 200-day average."
+    if r6 >= 40 or d200 >= 30:
+        return "Straight up", False, desc + " Extended: buying here chases a run."
+    if r6 <= -20 or d200 <= -15:
+        return "Straight down", False, desc + " Falling: wait for it to stop and base."
+    if -10 <= r6 <= 25 and -10 <= d200 <= 20:
+        return ("Sideways, slightly up" if r6 > 5 else "Sideways"), True, desc
+    return ("Rising fast" if r6 > 0 else "Drifting down"), False, desc
+
+
+def my_rules(price, f):
+    """Max's own criteria (Trading/Investing project rules)."""
+    R = {}
+    v, b, t = (f or {}).get("valuation", {}), (f or {}).get("balance", {}), (f or {}).get("ttm", {})
+    fy = (f or {}).get("fy", [])
+    ps = v.get("priceToSales")
+    R["sales"] = {"name": "Under 2x sales", "pass": None if ps is None else ps < 2, "value": ps,
+                  "why": f"Price/sales is {ps}." if ps is not None else "No sales data."}
+    nc = b.get("netCash")
+    R["cash"] = {"name": "More cash than debt", "pass": None if nc is None else nc > 0, "value": nc,
+                 "why": (f"Net cash ${nc / 1e9:.2f}B." if abs(nc) >= 1e9 else f"Net cash ${nc / 1e6:.0f}M.").replace("$-", "−$")
+                 if nc is not None else "No balance sheet data."}
+    g = t.get("revenueGrowth")
+    R["revenue"] = {"name": "Revenue growing", "pass": None if g is None else g > 0, "value": g,
+                    "why": f"Revenue {g:+.0f}% vs a year earlier." if g is not None else "No revenue data."}
+    q = [x for x in (f or {}).get("quarters", []) if x.get("eps") is not None]
+    eg_q = None
+    if len(q) >= 5:
+        ya = next((x for x in reversed(q[:-1]) if 355 <= _days(x["end"], q[-1]["end"]) <= 375), None)
+        if ya:
+            eg_q = (q[-1]["eps"], ya["eps"])
+    eg_a = fy[-1].get("epsGrowth") if fy else None
+    if eg_q:
+        cur, prev = eg_q
+        ok = cur > prev
+        why = f"Latest quarter EPS {cur:.2f} vs {prev:.2f} a year ago."
+    elif fy and fy[-1].get("eps") is not None and len(fy) > 1 and fy[-2].get("eps") is not None:
+        ok = fy[-1]["eps"] > fy[-2]["eps"]
+        why = f"Yearly EPS {fy[-1]['eps']:.2f} vs {fy[-2]['eps']:.2f} the year before."
+    else:
+        ok, why = None, "No earnings data."
+    R["earnings"] = {"name": "Earnings growing", "pass": ok, "value": eg_a, "why": why}
+    label, ok, why = chart_pattern(price)
+    R["chart"] = {"name": "Chart: sideways or slightly up", "pass": ok, "value": label,
+                  "why": (label + ". " if label else "") + why}
+    return R
+
+
 def canslim(price, f, inst, market, spy):
     L = {}
 
@@ -1177,6 +1349,13 @@ def main():
                         ferr.append("FMP: no statements for this symbol")
                 except Exception as e:  # noqa: BLE001
                     ferr.append(f"FMP: {e}")
+            if raw is None and FINNHUB_KEY:
+                try:
+                    raw = timed(f"{sym} Finnhub", from_finnhub, sym, limit=40)
+                    if raw is None:
+                        ferr.append("Finnhub: no filings for this symbol")
+                except Exception as e:  # noqa: BLE001
+                    ferr.append(f"Finnhub: {e}")
             if raw is None:
                 try:
                     raw = timed(f"{sym} Yahoo fundamentals", from_yahoo, sym, limit=30)
@@ -1200,6 +1379,8 @@ def main():
             rec["institutions"] = prev.get("institutions")
             rec["errors"]["institutions"] = str(e)
 
+        rec["rules"] = my_rules(rec["price"], rec.get("fundamentals")) \
+            if qtype not in ("ETF", "MUTUALFUND") else None
         rec["canslim"] = canslim(rec["price"], rec.get("fundamentals"), rec.get("institutions"), market, spy) \
             if qtype not in ("ETF", "MUTUALFUND") else None
 
