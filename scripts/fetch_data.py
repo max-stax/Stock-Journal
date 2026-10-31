@@ -20,6 +20,8 @@ import http.cookiejar
 import json
 import os
 import re
+import signal
+import socket
 import sys
 import time
 import urllib.error
@@ -47,6 +49,39 @@ def _decode(body, enc):
     if enc == "gzip" or body[:2] == b"\x1f\x8b":
         body = gzip.decompress(body)
     return body
+
+
+socket.setdefaulttimeout(15)
+TIMINGS = {}  # "SYM source" -> seconds, written to market.json so slow sources are visible
+
+
+SLOW = set()  # sources that hit their time limit; skipped for the rest of the run
+
+
+class Budget(BaseException):  # bypasses inner `except Exception` retries
+    pass
+
+
+def _alarm(*_):
+    raise Budget("time limit reached")
+
+
+def timed(label, fn, *a, limit=40):
+    """Run fn with a hard wall-clock limit (covers DNS stalls and slow trickling responses)."""
+    source = label.split(" ", 1)[-1]
+    if source in SLOW:
+        raise RuntimeError(f"skipped: {source} was too slow earlier this run")
+    t = time.time()
+    signal.signal(signal.SIGALRM, _alarm)
+    signal.alarm(limit)
+    try:
+        return fn(*a)
+    except Budget:
+        SLOW.add(source)
+        raise RuntimeError(f"gave up after {limit}s (source too slow)") from None
+    finally:
+        signal.alarm(0)
+        TIMINGS[label] = round(time.time() - t, 1)
 
 
 HOST_FAILS = {}  # host -> consecutive timeouts; after 2, skip the host for the rest of the run
@@ -1072,11 +1107,17 @@ def main():
     except Exception:  # noqa: BLE001
         old = {}
 
-    tmap, sec_err = sec_ticker_map()
+    try:
+        tmap, sec_err = timed("SEC ticker list", sec_ticker_map, limit=20)
+    except Exception as e:  # noqa: BLE001
+        tmap, sec_err = {}, str(e)
     sec_ok = bool(tmap)
     if sec_err:
         print("SEC unavailable, using Yahoo fundamentals:", sec_err, file=sys.stderr)
-    spy, _ = fetch_price("SPY")
+    try:
+        spy, _ = timed("SPY price", fetch_price, "SPY", limit=30)
+    except Exception:  # noqa: BLE001
+        spy = None
     market = market_direction(spy)
     meta = {"sec": "ok" if sec_ok else sec_err, "market": market,
             "spy": {k: spy.get(k) for k in ("last", "ret3m", "ret6m", "ret9m", "ret12m")} if spy else None,
@@ -1087,7 +1128,10 @@ def main():
         prev = old.get(sym, {})
         rec = {"symbol": sym, "errors": {}}
         cik, name = tmap.get(sym) or (prev.get("cik"), prev.get("name"))
-        price, err = fetch_price(sym)
+        try:
+            price, err = timed(f"{sym} price", fetch_price, sym, limit=30)
+        except Exception as e:  # noqa: BLE001
+            price, err = None, str(e)
         qtype = prev.get("quoteType")
         if price:
             name = name or price.pop("_name", None)
@@ -1104,20 +1148,20 @@ def main():
         else:
             if sec_ok and cik:
                 try:
-                    raw = from_sec(sec_facts(cik))
+                    raw = timed(f"{sym} SEC", lambda: from_sec(sec_facts(cik)), limit=30)
                 except Exception as e:  # noqa: BLE001
                     ferr.append(f"SEC: {e}")
                 time.sleep(0.25)
             if raw is None and FMP_KEY:
                 try:
-                    raw = from_fmp(sym)
+                    raw = timed(f"{sym} FMP", from_fmp, sym, limit=40)
                     if raw is None:
                         ferr.append("FMP: no statements for this symbol")
                 except Exception as e:  # noqa: BLE001
                     ferr.append(f"FMP: {e}")
             if raw is None:
                 try:
-                    raw = from_yahoo(sym)
+                    raw = timed(f"{sym} Yahoo fundamentals", from_yahoo, sym, limit=30)
                     if raw is None:
                         ferr.append("Yahoo: no financial statements returned")
                 except Exception as e:  # noqa: BLE001
@@ -1133,7 +1177,7 @@ def main():
             rec["errors"]["fundamentals"] = "; ".join(ferr)
 
         try:
-            rec["institutions"] = institutions(sym, prev.get("institutions"))
+            rec["institutions"] = timed(f"{sym} institutions", institutions, sym, prev.get("institutions"), limit=20)
         except Exception as e:  # noqa: BLE001
             rec["institutions"] = prev.get("institutions")
             rec["errors"]["institutions"] = str(e)
@@ -1141,7 +1185,10 @@ def main():
         rec["canslim"] = canslim(rec["price"], rec.get("fundamentals"), rec.get("institutions"), market, spy) \
             if qtype not in ("ETF", "MUTUALFUND") else None
 
-        news, err = fetch_news(sym, name)
+        try:
+            news, err = timed(f"{sym} news", fetch_news, sym, name, limit=30)
+        except Exception as e:  # noqa: BLE001
+            news, err = [], str(e)
         rec["news"] = news or prev.get("news", [])
         if err:
             rec["errors"]["news"] = err
@@ -1154,6 +1201,9 @@ def main():
               f"errors={rec.get('errors', {})}")
 
     with open(OUT_FILE, "w") as fh:
+        meta["timings"] = TIMINGS
+        meta["skippedHosts"] = [h for h, n in HOST_FAILS.items() if n >= 2]
+        meta["slowSources"] = sorted(SLOW)
         json.dump({"generated": datetime.now(timezone.utc).isoformat(timespec="seconds"), "meta": meta,
                    "tickers": out}, fh, separators=(",", ":"))
 
