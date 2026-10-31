@@ -53,7 +53,8 @@ def _decode(body, enc):
 
 socket.setdefaulttimeout(15)
 TIMINGS = {}
-_OLD_META_SPY = None  # "SYM source" -> seconds, written to market.json so slow sources are visible
+_OLD_META_SPY = None
+_PREV_GENERATED = ""  # "SYM source" -> seconds, written to market.json so slow sources are visible
 
 
 SLOW = set()  # sources that hit their time limit; skipped for the rest of the run
@@ -1109,8 +1110,15 @@ def analyze(raw, price):
     out["grade"] = grade(snap, latest, bvps_g)
     out["grade"]["asOf"] = t.get("asOf")
 
-    v = out["valuation"]
-    if price and shares and raw["currency"] == price.get("currency", "USD"):
+    out["valuation"] = valuation(t, latest, shares, raw["currency"], price)
+    out["fetchedAt"] = date.today().isoformat()
+    flags(out)
+    return out
+
+
+def valuation(t, latest, shares, currency, price):
+    v = {"sharesOutstanding": shares}
+    if price and shares and currency == price.get("currency", "USD"):
         mc = price["last"] * shares
         v["marketCap"] = mc
         if t.get("revenue"):
@@ -1123,8 +1131,7 @@ def analyze(raw, price):
             v["pe"] = round(mc / t["netIncome"], 1)
         if latest.get("equity") and latest["equity"] > 0:
             v["priceToBook"] = round(mc / latest["equity"], 1)
-    flags(out)
-    return out
+    return v
 
 
 def flags(f):
@@ -1407,12 +1414,13 @@ def fetch_news(sym, company):
 def main():
     with open(TICKERS_FILE) as fh:
         tickers = [t["symbol"].upper() for t in json.load(fh)["tickers"]]
-    global _OLD_META_SPY
+    global _OLD_META_SPY, _PREV_GENERATED
     try:
         with open(OUT_FILE) as fh:
             prev_all = json.load(fh)
         old = prev_all.get("tickers", {})
         _OLD_META_SPY = (prev_all.get("meta") or {}).get("spyPrice")
+        _PREV_GENERATED = prev_all.get("generated") or ""
     except Exception:  # noqa: BLE001
         old = {}
 
@@ -1458,7 +1466,7 @@ def main():
         if err and not price:
             rec["errors"]["price"] = err
 
-        raw, ferr = None, []
+        raw, ferr, keep_sec = None, [], None
         if qtype in ("ETF", "MUTUALFUND", "INDEX"):
             ferr.append("Fund/ETF: no company financials to grade")
         else:
@@ -1468,28 +1476,42 @@ def main():
                 except Exception as e:  # noqa: BLE001
                     ferr.append(f"SEC: {e}")
                 time.sleep(0.25)
-            if raw is None and FMP_KEY:
+            prev_f = prev.get("fundamentals") or {}
+            age = _days(prev_f.get("fetchedAt") or _PREV_GENERATED[:10], date.today().isoformat()) \
+                if (prev_f.get("fetchedAt") or _PREV_GENERATED) else 999
+            if raw is None and prev_f.get("source") == "SEC EDGAR" and age <= 45:
+                keep_sec = prev_f  # SEC is the source of truth; don't replace it with FMP/Finnhub/Yahoo
+            else:
+                keep_sec = None
+            if raw is None and keep_sec is None and FMP_KEY:
                 try:
                     raw = timed(f"{sym} FMP", from_fmp, sym, limit=40)
                     if raw is None:
                         ferr.append("FMP: no statements for this symbol")
                 except Exception as e:  # noqa: BLE001
                     ferr.append(f"FMP: {e}")
-            if raw is None and FINNHUB_KEY:
+            if raw is None and keep_sec is None and FINNHUB_KEY:
                 try:
                     raw = timed(f"{sym} Finnhub", from_finnhub, sym, limit=40)
                     if raw is None:
                         ferr.append("Finnhub: no filings for this symbol")
                 except Exception as e:  # noqa: BLE001
                     ferr.append(f"Finnhub: {e}")
-            if raw is None:
+            if raw is None and keep_sec is None:
                 try:
                     raw = timed(f"{sym} Yahoo fundamentals", from_yahoo, sym, limit=30)
                     if raw is None:
                         ferr.append("Yahoo: no financial statements returned")
                 except Exception as e:  # noqa: BLE001
                     ferr.append(f"Yahoo: {e}")
-        if raw:
+        if keep_sec and not raw:
+            f = dict(keep_sec)
+            f["valuation"] = valuation(f.get("ttm") or {}, f.get("balance") or {},
+                                       (f.get("valuation") or {}).get("sharesOutstanding"), f.get("currency", "USD"),
+                                       rec["price"])
+            f.setdefault("fetchedAt", _PREV_GENERATED[:10])
+            rec["fundamentals"] = f
+        elif raw:
             try:
                 rec["fundamentals"] = analyze(raw, rec["price"])
             except Exception as e:  # noqa: BLE001
