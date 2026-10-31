@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """Daily data job for Stock Journal.
 
-Reads data/tickers.json and writes data/market.json with, per ticker:
-  - price: last close, day change, 52-week range, 1-year weekly closes
-  - fundamentals: annual + trailing-twelve-month figures from SEC EDGAR filings,
-    balance sheet, valuation, and plain-language flags
-  - news: recent headlines from Yahoo Finance and Google News RSS
+Reads data/tickers.json and writes data/market.json. Per ticker:
+  price         last close, 52-week range, 1y weekly + 5y monthly closes,
+                moving averages, returns, up/down volume
+  fundamentals  income, cash flow and balance sheet by fiscal year, last 12
+                months, latest balance sheet, valuation, health grade, flags.
+                Source: SEC EDGAR when reachable, otherwise Yahoo Finance's
+                fundamentals feed (built from the same filings).
+  canslim       pass/fail per CAN SLIM letter
+  institutions  % held by institutions, number of holders, history
+  news          recent headlines (Yahoo Finance + Google News RSS)
 
-Standard library only. Every source is optional: if one fails for a ticker,
-the previous day's value is kept and the error is recorded.
+Standard library only. Every source is optional: if one fails, the previous
+day's value is kept and the reason is recorded under "errors".
 """
 import gzip
+import http.cookiejar
 import json
 import os
-import urllib.error
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -27,37 +33,41 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TICKERS_FILE = os.path.join(ROOT, "data", "tickers.json")
 OUT_FILE = os.path.join(ROOT, "data", "market.json")
 
-# SEC asks every client to identify itself with a contact. Set the
-# SEC_USER_AGENT repository variable to e.g. "Stock Journal you@example.com".
 SEC_UA = os.environ.get("SEC_USER_AGENT") or "Stock Journal research max-stax@users.noreply.github.com"
-WEB_UA = "Mozilla/5.0 (compatible; StockJournal/1.0)"
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+# Default grade weights (the app lets you change these)
+WEIGHTS = {"growth": 20, "profit": 20, "cash": 20, "balance": 25, "dilution": 15}
 
 
-# ---------------------------------------------------------------- http
+# ================================================================ http
 
-def get(url, ua=WEB_UA, timeout=20, tries=3, headers=None):
+def _decode(body, enc):
+    if enc == "gzip" or body[:2] == b"\x1f\x8b":
+        body = gzip.decompress(body)
+    return body
+
+
+def get(url, ua=BROWSER_UA, timeout=25, tries=3, opener=None):
     last = None
+    op = opener or urllib.request.build_opener()
     for i in range(tries):
         try:
-            h = {"User-Agent": ua, "Accept-Encoding": "gzip, deflate", "Accept": "*/*"}
-            h.update(headers or {})
-            req = urllib.request.Request(url, headers=h)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                body = r.read()
-                if r.headers.get("Content-Encoding") == "gzip" or body[:2] == b"\x1f\x8b":
-                    body = gzip.decompress(body)
-                return body
+            req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept-Encoding": "gzip, deflate",
+                                                       "Accept": "*/*"})
+            with op.open(req, timeout=timeout) as r:
+                return _decode(r.read(), r.headers.get("Content-Encoding"))
         except urllib.error.HTTPError as e:
             snippet = ""
             try:
-                raw = e.read()
-                if raw[:2] == b"\x1f\x8b":
-                    raw = gzip.decompress(raw)
-                snippet = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw.decode("utf-8", "replace")))[:160]
+                raw = _decode(e.read(), e.headers.get("Content-Encoding"))
+                title = re.search(rb"<title>(.*?)</title>", raw, re.S)
+                snippet = (title.group(1) if title else raw[:120]).decode("utf-8", "replace").strip()
             except Exception:  # noqa: BLE001
                 pass
-            last = RuntimeError(f"HTTP {e.code} from {urllib.parse.urlsplit(url).netloc}: {snippet}".strip())
-            if e.code in (401, 403, 404):
+            last = RuntimeError(f"HTTP {e.code} from {urllib.parse.urlsplit(url).netloc} {snippet}".strip())
+            if e.code in (400, 401, 403, 404):
                 break
         except Exception as e:  # noqa: BLE001
             last = RuntimeError(f"{type(e).__name__}: {e}")
@@ -65,56 +75,129 @@ def get(url, ua=WEB_UA, timeout=20, tries=3, headers=None):
     raise last
 
 
-def get_json(url, ua=WEB_UA):
-    return json.loads(get(url, ua))
+def get_json(url, ua=BROWSER_UA, opener=None):
+    return json.loads(get(url, ua, opener=opener))
 
 
-# ---------------------------------------------------------------- prices
+def _days(a, b):
+    return (date.fromisoformat(b) - date.fromisoformat(a)).days
+
+
+def pct(a, b):
+    if a is None or b is None or b == 0:
+        return None
+    return round((a / b - 1) * 100, 1) if b > 0 else None
+
+
+def ratio(a, b):
+    if a is None or b in (None, 0):
+        return None
+    return round(a / b * 100, 1)
+
+
+def _interp(x, pts):
+    """Piecewise-linear value from [(x, y), ...] sorted by x."""
+    if x <= pts[0][0]:
+        return pts[0][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if x <= x1:
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return pts[-1][1]
+
+
+# ================================================================ Yahoo session (cookies + crumb)
+
+class Yahoo:
+    def __init__(self):
+        self.op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.crumb = None
+
+    def _crumb(self):
+        if self.crumb is None:
+            try:
+                get("https://fc.yahoo.com", opener=self.op, tries=1)
+            except Exception:  # noqa: BLE001  (404 is normal; it still sets the cookie)
+                pass
+            try:
+                self.crumb = get("https://query2.finance.yahoo.com/v1/test/getcrumb", opener=self.op).decode().strip()
+            except Exception:  # noqa: BLE001
+                self.crumb = ""
+        return self.crumb
+
+    def json(self, url, crumb=False):
+        if crumb or "quoteSummary" in url:
+            c = self._crumb()
+            if c:
+                url += ("&" if "?" in url else "?") + "crumb=" + urllib.parse.quote(c)
+        try:
+            return get_json(url, opener=self.op)
+        except RuntimeError as e:
+            if "401" in str(e) and not crumb:
+                return self.json(url, crumb=True)
+            raise
+
+
+YH = Yahoo()
+
+
+# ================================================================ prices
 
 def price_yahoo(sym):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym)}?range=5y&interval=1d"
-    res = get_json(url)["chart"]["result"][0]
-    meta = res["meta"]
-    ts = res.get("timestamp") or []
-    closes = res["indicators"]["quote"][0].get("close") or []
-    hist = [(datetime.fromtimestamp(t, timezone.utc).date().isoformat(), round(c, 4))
-            for t, c in zip(ts, closes) if c is not None]
-    return build_price(hist, meta.get("regularMarketPrice"), meta.get("currency", "USD"))
+    res = YH.json(url)["chart"]["result"][0]
+    q = res["indicators"]["quote"][0]
+    hist = [(datetime.fromtimestamp(t, timezone.utc).date().isoformat(), round(c, 4), v or 0)
+            for t, c, v in zip(res.get("timestamp") or [], q.get("close") or [], q.get("volume") or [])
+            if c is not None]
+    return build_price(hist, res["meta"].get("regularMarketPrice"), res["meta"].get("currency", "USD"))
 
 
 def price_stooq(sym):
-    url = f"https://stooq.com/q/d/l/?s={sym.lower()}.us&i=d"
-    rows = get(url).decode().strip().splitlines()[1:]
+    rows = get(f"https://stooq.com/q/d/l/?s={sym.lower()}.us&i=d").decode().strip().splitlines()[1:]
     hist = []
     for line in rows[-1300:]:
         p = line.split(",")
         if len(p) >= 5 and p[4] not in ("", "N/D"):
-            hist.append((p[0], float(p[4])))
+            hist.append((p[0], float(p[4]), float(p[5]) if len(p) > 5 and p[5] else 0))
     return build_price(hist, None, "USD")
 
 
 def build_price(hist, last=None, currency="USD"):
-    """hist: [(iso_date, close)] daily, up to ~5 years (split-adjusted)."""
+    """hist: [(iso_date, close, volume)] daily, up to ~5 years (split-adjusted)."""
     if not hist:
         raise ValueError("no price history")
+    hist = [h if len(h) == 3 else (h[0], h[1], 0) for h in hist]
     last = float(last) if last else hist[-1][1]
     prev = hist[-2][1] if len(hist) > 1 else last
     if hist[-1][1] != last:
         prev = hist[-1][1]
+    closes = [c for _, c, _ in hist]
     year = hist[-252:]
-    closes = [c for _, c in year]
-    weekly = year[::5] + ([year[-1]] if (len(year) - 1) % 5 else [])
+    yc = [c for _, c, _ in year]
+    weekly = [(d, c) for d, c, _ in year[::5]] + ([(year[-1][0], year[-1][1])] if (len(year) - 1) % 5 else [])
     monthly = {}
-    for d, c in hist:
-        monthly[d[:7]] = (d, c)  # last close of each month
+    for d, c, _ in hist:
+        monthly[d[:7]] = (d, c)
+
+    def ret(n):
+        return round((last / closes[-n - 1] - 1) * 100, 1) if len(closes) > n else None
+
+    def ma(n):
+        return round(sum(closes[-n:]) / n, 4) if len(closes) >= n else None
+
+    up = dn = 0.0
+    for (_, c0, _), (_, c1, v1) in zip(hist[-51:-1], hist[-50:]):
+        if c1 > c0:
+            up += v1
+        elif c1 < c0:
+            dn += v1
     return {
-        "last": round(last, 4),
-        "prevClose": round(prev, 4),
-        "change": round(last - prev, 4),
-        "changePct": round((last / prev - 1) * 100, 2) if prev else None,
-        "hi52": max(closes), "lo52": min(closes),
-        "asOf": hist[-1][0],
-        "currency": currency,
+        "last": round(last, 4), "prevClose": round(prev, 4),
+        "change": round(last - prev, 4), "changePct": round((last / prev - 1) * 100, 2) if prev else None,
+        "hi52": max(yc), "lo52": min(yc), "asOf": hist[-1][0], "currency": currency,
+        "ma50": ma(50), "ma200": ma(200),
+        "ret3m": ret(63), "ret6m": ret(126), "ret9m": ret(189), "ret12m": ret(252),
+        "upDownVol50": round(up / dn, 2) if dn else None,
         "history": [[d, c] for d, c in weekly],
         "monthly": [[d, c] for d, c in monthly.values()],
     }
@@ -130,100 +213,86 @@ def fetch_price(sym):
     return None, "; ".join(errors)
 
 
-# ---------------------------------------------------------------- SEC fundamentals
+def rs_weighted(p):
+    """IBD-style weighting: latest quarter counts double."""
+    if not p or p.get("ret12m") is None:
+        return None
+    r3, r6, r9, r12 = (p.get(k) or 0 for k in ("ret3m", "ret6m", "ret9m", "ret12m"))
+    return round(0.4 * r3 + 0.2 * r6 + 0.2 * r9 + 0.2 * r12, 1)
+
+
+# ================================================================ normalized fundamentals
+#
+# Both sources produce:
+#   fy:        [{end, revenue, grossProfit, operatingIncome, netIncome, operatingCashFlow, capex,
+#                dilutedShares, sbc, eps, <balance fields>}]   (oldest -> newest)
+#   ttm:       {asOf, revenue, grossProfit, operatingIncome, netIncome, operatingCashFlow, capex, sbc, eps}
+#   growth:    latest revenue growth vs a year ago (or None)
+#   bal:       {date: {cash, sti, totalDebt, equity, currentAssets, currentLiabilities,
+#                      totalAssets, totalLiabilities, intangibles}}
+#   quarters:  [{end, revenue, eps, netIncome}]   (oldest -> newest)
+#   shares:    latest shares outstanding
+#   currency
+
+BAL_KEYS = ("cash", "sti", "totalDebt", "equity", "currentAssets", "currentLiabilities",
+            "totalAssets", "totalLiabilities", "intangibles")
+
+
+# ---------------------------------------------------------------- SEC EDGAR
 
 ANNUAL_FORMS = {"10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A", "10-KT"}
 QUARTER_FORMS = {"10-Q", "10-Q/A", "6-K"}
 
-CONCEPTS = {
-    "revenue": [
-        ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax"),
-        ("us-gaap", "Revenues"),
-        ("us-gaap", "RevenueFromContractWithCustomerIncludingAssessedTax"),
-        ("us-gaap", "SalesRevenueNet"),
-        ("us-gaap", "RevenuesNetOfInterestExpense"),
-        ("ifrs-full", "Revenue"),
-    ],
+SEC_DUR = {
+    "revenue": [("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax"), ("us-gaap", "Revenues"),
+                ("us-gaap", "RevenueFromContractWithCustomerIncludingAssessedTax"), ("us-gaap", "SalesRevenueNet"),
+                ("us-gaap", "RevenuesNetOfInterestExpense"), ("ifrs-full", "Revenue")],
     "grossProfit": [("us-gaap", "GrossProfit"), ("ifrs-full", "GrossProfit")],
-    "costOfRevenue": [
-        ("us-gaap", "CostOfRevenue"),
-        ("us-gaap", "CostOfGoodsAndServicesSold"),
-        ("ifrs-full", "CostOfSales"),
-    ],
-    "operatingIncome": [
-        ("us-gaap", "OperatingIncomeLoss"),
-        ("ifrs-full", "ProfitLossFromOperatingActivities"),
-    ],
-    "netIncome": [
-        ("us-gaap", "NetIncomeLoss"),
-        ("us-gaap", "ProfitLoss"),
-        ("ifrs-full", "ProfitLossAttributableToOwnersOfParent"),
-        ("ifrs-full", "ProfitLoss"),
-    ],
-    "operatingCashFlow": [
-        ("us-gaap", "NetCashProvidedByUsedInOperatingActivities"),
-        ("us-gaap", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"),
-        ("ifrs-full", "CashFlowsFromUsedInOperatingActivities"),
-    ],
-    "capex": [
-        ("us-gaap", "PaymentsToAcquirePropertyPlantAndEquipment"),
-        ("us-gaap", "PaymentsToAcquireProductiveAssets"),
-        ("ifrs-full", "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities"),
-        ("ifrs-full", "PurchaseOfPropertyPlantAndEquipment"),
-    ],
-    "dilutedShares": [
-        ("us-gaap", "WeightedAverageNumberOfDilutedSharesOutstanding"),
-        ("ifrs-full", "WeightedAverageNumberOfShareOutstandingBasicAndDiluted"),
-        ("us-gaap", "WeightedAverageNumberOfSharesOutstandingBasic"),
-    ],
+    "costOfRevenue": [("us-gaap", "CostOfRevenue"), ("us-gaap", "CostOfGoodsAndServicesSold"),
+                      ("ifrs-full", "CostOfSales")],
+    "operatingIncome": [("us-gaap", "OperatingIncomeLoss"), ("ifrs-full", "ProfitLossFromOperatingActivities")],
+    "netIncome": [("us-gaap", "NetIncomeLoss"), ("us-gaap", "ProfitLoss"),
+                  ("ifrs-full", "ProfitLossAttributableToOwnersOfParent"), ("ifrs-full", "ProfitLoss")],
+    "operatingCashFlow": [("us-gaap", "NetCashProvidedByUsedInOperatingActivities"),
+                          ("us-gaap", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"),
+                          ("ifrs-full", "CashFlowsFromUsedInOperatingActivities")],
+    "capex": [("us-gaap", "PaymentsToAcquirePropertyPlantAndEquipment"),
+              ("us-gaap", "PaymentsToAcquireProductiveAssets"),
+              ("ifrs-full", "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities"),
+              ("ifrs-full", "PurchaseOfPropertyPlantAndEquipment")],
+    "dilutedShares": [("us-gaap", "WeightedAverageNumberOfDilutedSharesOutstanding"),
+                      ("ifrs-full", "WeightedAverageNumberOfShareOutstandingBasicAndDiluted"),
+                      ("us-gaap", "WeightedAverageNumberOfSharesOutstandingBasic")],
     "sbc": [("us-gaap", "ShareBasedCompensation"), ("us-gaap", "AllocatedShareBasedCompensationExpense")],
+    "eps": [("us-gaap", "EarningsPerShareDiluted"), ("us-gaap", "EarningsPerShareBasicAndDiluted"),
+            ("ifrs-full", "DilutedEarningsLossPerShare")],
 }
-
-BALANCE = {
-    "cash": [
-        ("us-gaap", "CashAndCashEquivalentsAtCarryingValue"),
-        ("us-gaap", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"),
-        ("ifrs-full", "CashAndCashEquivalents"),
-    ],
-    "shortTermInvestments": [
-        ("us-gaap", "ShortTermInvestments"),
-        ("us-gaap", "MarketableSecuritiesCurrent"),
-        ("us-gaap", "AvailableForSaleSecuritiesDebtSecuritiesCurrent"),
-        ("ifrs-full", "CurrentInvestments"),
-    ],
-    "longTermDebt": [
-        ("us-gaap", "LongTermDebtNoncurrent"),
-        ("us-gaap", "LongTermDebt"),
-        ("us-gaap", "ConvertibleNotesPayableNoncurrent"),
-        ("us-gaap", "SeniorNotesNoncurrent"),
-        ("ifrs-full", "NoncurrentBorrowings"),
-        ("ifrs-full", "Borrowings"),
-    ],
-    "currentDebt": [
-        ("us-gaap", "LongTermDebtCurrent"),
-        ("us-gaap", "DebtCurrent"),
-        ("us-gaap", "ConvertibleNotesPayableCurrent"),
-        ("ifrs-full", "CurrentBorrowings"),
-    ],
-    "equity": [
-        ("us-gaap", "StockholdersEquity"),
-        ("us-gaap", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
-        ("ifrs-full", "EquityAttributableToOwnersOfParent"),
-        ("ifrs-full", "Equity"),
-    ],
+SEC_INST = {
+    "cash": [("us-gaap", "CashAndCashEquivalentsAtCarryingValue"),
+             ("us-gaap", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"),
+             ("ifrs-full", "CashAndCashEquivalents")],
+    "sti": [("us-gaap", "ShortTermInvestments"), ("us-gaap", "MarketableSecuritiesCurrent"),
+            ("us-gaap", "AvailableForSaleSecuritiesDebtSecuritiesCurrent"), ("ifrs-full", "CurrentInvestments")],
+    "ltDebt": [("us-gaap", "LongTermDebtNoncurrent"), ("us-gaap", "LongTermDebt"),
+               ("us-gaap", "ConvertibleNotesPayableNoncurrent"), ("us-gaap", "SeniorNotesNoncurrent"),
+               ("ifrs-full", "NoncurrentBorrowings"), ("ifrs-full", "Borrowings")],
+    "stDebt": [("us-gaap", "LongTermDebtCurrent"), ("us-gaap", "DebtCurrent"),
+               ("us-gaap", "ConvertibleNotesPayableCurrent"), ("ifrs-full", "CurrentBorrowings")],
+    "equity": [("us-gaap", "StockholdersEquity"),
+               ("us-gaap", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
+               ("ifrs-full", "EquityAttributableToOwnersOfParent"), ("ifrs-full", "Equity")],
     "currentAssets": [("us-gaap", "AssetsCurrent"), ("ifrs-full", "CurrentAssets")],
     "currentLiabilities": [("us-gaap", "LiabilitiesCurrent"), ("ifrs-full", "CurrentLiabilities")],
     "totalAssets": [("us-gaap", "Assets"), ("ifrs-full", "Assets")],
+    "totalLiabilities": [("us-gaap", "Liabilities"), ("ifrs-full", "Liabilities")],
+    "goodwill": [("us-gaap", "Goodwill"), ("ifrs-full", "Goodwill")],
+    "otherIntangibles": [("us-gaap", "IntangibleAssetsNetExcludingGoodwill"),
+                         ("us-gaap", "FiniteLivedIntangibleAssetsNet"),
+                         ("ifrs-full", "IntangibleAssetsOtherThanGoodwill")],
 }
 
-SHARES_OUT = [("dei", "EntityCommonStockSharesOutstanding")]
 
-
-def _days(a, b):
-    return (date.fromisoformat(b) - date.fromisoformat(a)).days
-
-
-def _unit_facts(facts, tax, concept, unit_pref):
+def _unit_rows(facts, tax, concept, unit_pref):
     node = facts.get(tax, {}).get(concept)
     if not node:
         return None, None
@@ -231,354 +300,147 @@ def _unit_facts(facts, tax, concept, unit_pref):
     for u in unit_pref:
         if u in units:
             return units[u], u
-    # Fall back to any currency-looking unit (IFRS filers in other currencies)
     for u, v in units.items():
-        if re.fullmatch(r"[A-Z]{3}", u):
+        if re.fullmatch(r"[A-Z]{3}(/shares)?", u) and ("/shares" in u) == any("/shares" in x for x in unit_pref):
             return v, u
     return None, None
 
 
-def duration_facts(facts, candidates, unit_pref=("USD",)):
-    """All duration facts across candidate concepts (earlier concept wins on ties)."""
+def _dur(facts, cands, unit_pref):
     out, unit_used = {}, None
-    for tax, concept in candidates:
-        rows, unit = _unit_facts(facts, tax, concept, unit_pref)
+    for tax, concept in cands:
+        rows, unit = _unit_rows(facts, tax, concept, unit_pref)
         if not rows:
             continue
         for r in rows:
-            if "start" not in r or "end" not in r:
+            if "start" not in r:
                 continue
             key = (r["start"], r["end"])
-            prev = out.get(key)
-            if prev is None or (prev["_c"] == concept and r.get("filed", "") > prev.get("filed", "")):
-                out[key] = {**r, "_c": concept, "_u": unit}
+            p = out.get(key)
+            if p is None or (p["_c"] == concept and r.get("filed", "") > p.get("filed", "")):
+                out[key] = {**r, "_c": concept}
         unit_used = unit_used or unit
     return list(out.values()), unit_used
 
 
-def instant_facts(facts, candidates, unit_pref=("USD",)):
+def _inst(facts, cands, unit_pref):
     out = {}
-    for tax, concept in candidates:
-        rows, unit = _unit_facts(facts, tax, concept, unit_pref)
-        if not rows:
-            continue
-        for r in rows:
-            if "start" in r or "end" not in r:
+    for tax, concept in cands:
+        rows, _ = _unit_rows(facts, tax, concept, unit_pref)
+        for r in rows or []:
+            if "start" in r:
                 continue
-            prev = out.get(r["end"])
-            if prev is None or (prev["_c"] == concept and r.get("filed", "") > prev.get("filed", "")):
-                out[r["end"]] = {**r, "_c": concept, "_u": unit}
-    return out
+            p = out.get(r["end"])
+            if p is None or (p["_c"] == concept and r.get("filed", "") > p.get("filed", "")):
+                out[r["end"]] = {**r, "_c": concept}
+    return {d: v["val"] for d, v in out.items()}
 
 
-def annual(rows):
-    """end -> value for ~12-month periods reported in annual forms."""
+def _annual(rows):
     res = {}
     for r in rows:
-        if r.get("form") not in ANNUAL_FORMS:
-            continue
-        d = _days(r["start"], r["end"])
-        if 330 <= d <= 400:
+        if r.get("form") in ANNUAL_FORMS and 330 <= _days(r["start"], r["end"]) <= 400:
             if r["end"] not in res or r.get("filed", "") > res[r["end"]][1]:
                 res[r["end"]] = (r["val"], r.get("filed", ""))
     return {k: v[0] for k, v in sorted(res.items())}
 
 
-def ttm(rows, last_fy_end, fy_val):
-    """Trailing twelve months = last FY + current YTD - prior-year YTD."""
-    if last_fy_end is None or fy_val is None:
+def _ttm(rows, fy_end, fy_val):
+    """last FY + current YTD - prior-year YTD. Returns (value, asOf, ytd_growth)."""
+    if fy_end is None or fy_val is None:
         return None, None, None
-    ytd = [r for r in rows if r["end"] > last_fy_end and 60 <= _days(r["start"], r["end"]) <= 300
-           and r.get("form") in QUARTER_FORMS | ANNUAL_FORMS]
+    ytd = [r for r in rows if r["end"] > fy_end and 60 <= _days(r["start"], r["end"]) <= 300]
     if not ytd:
-        return fy_val, last_fy_end, None
-    latest_end = max(r["end"] for r in ytd)
-    cur = max((r for r in ytd if r["end"] == latest_end), key=lambda r: _days(r["start"], r["end"]))
+        return fy_val, fy_end, None
+    end = max(r["end"] for r in ytd)
+    cur = max((r for r in ytd if r["end"] == end), key=lambda r: _days(r["start"], r["end"]))
     span = _days(cur["start"], cur["end"])
     prior = [r for r in rows if 355 <= _days(r["end"], cur["end"]) <= 375
              and abs(_days(r["start"], r["end"]) - span) <= 10]
     if not prior:
-        return fy_val, last_fy_end, None
+        return fy_val, fy_end, None
     prev = max(prior, key=lambda r: r.get("filed", ""))
     return fy_val + cur["val"] - prev["val"], cur["end"], pct(cur["val"], prev["val"])
 
 
-def pct(a, b):
-    if a is None or b in (None, 0):
+def _quarters(rows):
+    """end -> 3-month value, including Q4 derived as FY minus 9-month YTD."""
+    q = {}
+    for r in rows:
+        if 80 <= _days(r["start"], r["end"]) <= 100:
+            q[r["end"]] = r["val"]
+    for r in rows:
+        if r.get("form") in ANNUAL_FORMS and 330 <= _days(r["start"], r["end"]) <= 400 and r["end"] not in q:
+            nine = [x for x in rows if x["start"] == r["start"] and 250 <= _days(x["start"], x["end"]) <= 290]
+            if nine:
+                q[r["end"]] = r["val"] - max(nine, key=lambda x: x["end"])["val"]
+    return q
+
+
+def from_sec(facts):
+    rev_rows, currency = _dur(facts, SEC_DUR["revenue"], ("USD",))
+    currency = currency or "USD"
+    up = (currency,)
+    rows = {k: (rev_rows if k == "revenue" else
+                _dur(facts, c, ("shares",) if k == "dilutedShares" else
+                     (f"{currency}/shares",) if k == "eps" else up)[0])
+            for k, c in SEC_DUR.items()}
+    ann = {k: _annual(v) for k, v in rows.items()}
+    ends = sorted(ann["revenue"] or ann["netIncome"])[-5:]
+    if not ends:
         return None
-    return round((a / b - 1) * 100, 1) if b > 0 else None
+    inst = {k: _inst(facts, c, up) for k, c in SEC_INST.items()}
 
+    def bal_at(d, tol=10):
+        b = {}
+        for k in inst:
+            near = [x for x in inst[k] if abs(_days(x, d)) <= tol]
+            b[k] = inst[k][min(near, key=lambda x: abs(_days(x, d)))] if near else None
+        debt = None if b["ltDebt"] is None and b["stDebt"] is None else (b["ltDebt"] or 0) + (b["stDebt"] or 0)
+        intang = None if b["goodwill"] is None and b["otherIntangibles"] is None else \
+            (b["goodwill"] or 0) + (b["otherIntangibles"] or 0)
+        tl = b["totalLiabilities"]
+        if tl is None and b["totalAssets"] is not None and b["equity"] is not None:
+            tl = b["totalAssets"] - b["equity"]
+        return {"cash": b["cash"], "sti": b["sti"], "totalDebt": debt, "equity": b["equity"],
+                "currentAssets": b["currentAssets"], "currentLiabilities": b["currentLiabilities"],
+                "totalAssets": b["totalAssets"], "totalLiabilities": tl,
+                "intangibles": intang if intang is not None or b["totalAssets"] is None else 0}
 
-def ratio(a, b):
-    if a is None or b in (None, 0):
-        return None
-    return round(a / b * 100, 1)
+    fy = []
+    for e in ends:
+        row = {"end": e, **{k: ann[k].get(e) for k in SEC_DUR}}
+        if row["grossProfit"] is None and row["revenue"] is not None and row["costOfRevenue"] is not None:
+            row["grossProfit"] = row["revenue"] - row["costOfRevenue"]
+        row.update(bal_at(e))
+        fy.append(row)
 
-
-def fundamentals(facts, price):
-    out = {"fy": [], "ttm": {}, "balance": {}, "valuation": {}, "flags": [], "strengths": []}
-    series, ttm_vals, currency = {}, {}, None
-    rev_rows, rev_unit = duration_facts(facts, CONCEPTS["revenue"])
-    currency = rev_unit or "USD"
-    unit_pref = (currency,)
-    rows_by = {}
-    for k, cands in CONCEPTS.items():
-        rows, _ = duration_facts(facts, cands, ("shares",) if k == "dilutedShares" else unit_pref)
-        rows_by[k] = rows
-        series[k] = annual(rows)
-
-    fy_ends = sorted(series["revenue"] or series["netIncome"])[-5:]
-    if not fy_ends:
-        return None
-    out["currency"] = currency
-    for end in fy_ends:
-        g = lambda k: series[k].get(end)  # noqa: E731
-        rev = g("revenue")
-        gp = g("grossProfit")
-        if gp is None and rev is not None and g("costOfRevenue") is not None:
-            gp = rev - g("costOfRevenue")
-        ocf, capex = g("operatingCashFlow"), g("capex")
-        fcf = ocf - abs(capex) if ocf is not None and capex is not None else None
-        out["fy"].append({
-            "end": end, "revenue": rev, "grossProfit": gp, "operatingIncome": g("operatingIncome"),
-            "netIncome": g("netIncome"), "operatingCashFlow": ocf, "capex": capex, "fcf": fcf,
-            "dilutedShares": g("dilutedShares"), "sbc": g("sbc"),
-        })
-    prev = None
-    for row in out["fy"]:
-        row["revenueGrowth"] = pct(row["revenue"], prev["revenue"]) if prev else None
-        row["shareChange"] = pct(row["dilutedShares"], prev["dilutedShares"]) if prev else None
-        row["grossMargin"] = ratio(row["grossProfit"], row["revenue"])
-        row["operatingMargin"] = ratio(row["operatingIncome"], row["revenue"])
-        row["netMargin"] = ratio(row["netIncome"], row["revenue"])
-        row["fcfMargin"] = ratio(row["fcf"], row["revenue"])
-        prev = row
-
-    last_end = fy_ends[-1]
-    t_end, ytd_growth = None, None
-    for k in ("revenue", "grossProfit", "operatingIncome", "netIncome", "operatingCashFlow", "capex", "sbc"):
-        v, e, gr = ttm(rows_by[k], last_end, series[k].get(last_end))
-        ttm_vals[k] = v
+    last = ends[-1]
+    ttm, as_of, growth = {}, last, None
+    for k in ("revenue", "grossProfit", "operatingIncome", "netIncome", "operatingCashFlow", "capex", "sbc", "eps"):
+        v, e, g = _ttm(rows[k], last, ann[k].get(last))
+        ttm[k] = v
         if k == "revenue":
-            t_end, ytd_growth = e, gr
-    if ttm_vals.get("operatingCashFlow") is not None and ttm_vals.get("capex") is not None:
-        ttm_vals["fcf"] = ttm_vals["operatingCashFlow"] - abs(ttm_vals["capex"])
-    else:
-        ttm_vals["fcf"] = None
-    # Growth: latest year-to-date vs same period last year; else last fiscal year
-    growth = ytd_growth if ytd_growth is not None else out["fy"][-1].get("revenueGrowth")
-    out["ttm"] = {**ttm_vals, "asOf": t_end,
-                  "revenueGrowth": growth,
-                  "grossMargin": ratio(ttm_vals.get("grossProfit"), ttm_vals.get("revenue")),
-                  "operatingMargin": ratio(ttm_vals.get("operatingIncome"), ttm_vals.get("revenue")),
-                  "fcfMargin": ratio(ttm_vals.get("fcf"), ttm_vals.get("revenue"))}
+            as_of, growth = e, g
+    ttm["asOf"] = as_of
 
-    # Balance sheet: most recent instant date that has cash or equity
-    inst = {k: instant_facts(facts, c, unit_pref) for k, c in BALANCE.items()}
-    dates = sorted(set(inst["cash"]) | set(inst["equity"]))
-    if dates:
-        d = dates[-1]
-        b = {k: (inst[k].get(d) or {}).get("val") for k in BALANCE}
-        b["asOf"] = d
-        debt = (b.get("longTermDebt") or 0) + (b.get("currentDebt") or 0)
-        cashlike = (b.get("cash") or 0) + (b.get("shortTermInvestments") or 0)
-        b["totalDebt"], b["cashAndInvestments"] = debt, cashlike
-        b["netCash"] = cashlike - debt
-        b["currentRatio"] = round(b["currentAssets"] / b["currentLiabilities"], 2) \
-            if b.get("currentAssets") and b.get("currentLiabilities") else None
-        b["debtToEquity"] = round(debt / b["equity"], 2) if b.get("equity") and b["equity"] > 0 else None
-        out["balance"] = b
-        # debt a year earlier, for trend
-        year_ago = [x for x in dates if 330 <= _days(x, d) <= 400]
-        if year_ago:
-            y = year_ago[-1]
-            out["balance"]["totalDebtYearAgo"] = ((inst["longTermDebt"].get(y) or {}).get("val") or 0) + \
-                ((inst["currentDebt"].get(y) or {}).get("val") or 0)
-
-    # Shares outstanding and valuation
-    so = instant_facts(facts, SHARES_OUT, ("shares",))
-    shares = so[max(so)]["val"] if so else (out["fy"][-1].get("dilutedShares"))
-    v = out["valuation"]
-    v["sharesOutstanding"] = shares
-    if price and shares and currency == price.get("currency", "USD"):
-        mc = price["last"] * shares
-        v["marketCap"] = mc
-        if ttm_vals.get("revenue"):
-            v["priceToSales"] = round(mc / ttm_vals["revenue"], 1)
-            if out["balance"]:
-                v["evToSales"] = round((mc - out["balance"]["netCash"]) / ttm_vals["revenue"], 1)
-        if ttm_vals.get("fcf") and ttm_vals["fcf"] > 0:
-            v["priceToFcf"] = round(mc / ttm_vals["fcf"], 1)
-        if ttm_vals.get("netIncome") and ttm_vals["netIncome"] > 0:
-            v["pe"] = round(mc / ttm_vals["netIncome"], 1)
-
-    # Balance sheet at each fiscal year end (for the yearly grade)
-    for row in out["fy"]:
-        bal = {}
-        for k in ("cash", "shortTermInvestments", "longTermDebt", "currentDebt", "equity",
-                  "currentAssets", "currentLiabilities"):
-            near = [d for d in inst[k] if abs(_days(d, row["end"])) <= 10]
-            bal[k] = inst[k][near[0]]["val"] if near else None
-        if bal["cash"] is not None or bal["longTermDebt"] is not None:
-            debt = (bal["longTermDebt"] or 0) + (bal["currentDebt"] or 0)
-            row["netCash"] = (bal["cash"] or 0) + (bal["shortTermInvestments"] or 0) - debt
-        else:
-            row["netCash"] = None
-        row["currentRatio"] = round(bal["currentAssets"] / bal["currentLiabilities"], 2) \
-            if bal["currentAssets"] and bal["currentLiabilities"] else None
-        row["grade"] = grade(row)
-
-    latest = {
-        "revenueGrowth": out["ttm"].get("revenueGrowth"),
-        "operatingMargin": out["ttm"].get("operatingMargin"),
-        "fcfMargin": out["ttm"].get("fcfMargin"),
-        "fcf": out["ttm"].get("fcf"),
-        "revenue": out["ttm"].get("revenue"),
-        "netCash": out["balance"].get("netCash") if out["balance"] else None,
-        "currentRatio": out["balance"].get("currentRatio") if out["balance"] else None,
-        "shareChange": out["fy"][-1].get("shareChange"),
-    }
-    out["grade"] = grade(latest)
-    out["grade"]["asOf"] = out["ttm"].get("asOf")
-
-    flag_and_strengths(out)
-    return out
-
-
-# ---------------------------------------------------------------- grading
-
-def _interp(x, pts):
-    """Piecewise-linear score from [(x, score), ...] sorted by x."""
-    if x <= pts[0][0]:
-        return pts[0][1]
-    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
-        if x <= x1:
-            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
-    return pts[-1][1]
-
-
-def grade(r):
-    """0-100 financial-health score from one period's numbers.
-
-    A heuristic, not a forecast. Missing parts are left out and the score is
-    rescaled over the parts that exist.
-    """
-    parts = []
-
-    def add(key, label, mx, value, score, why):
-        parts.append({"key": key, "label": label, "max": mx, "value": value,
-                      "score": round(score, 1), "why": why})
-
-    g = r.get("revenueGrowth")
-    if g is not None:
-        add("growth", "Growth", 25, g, _interp(g, [(-10, 0), (0, 8), (10, 15), (20, 20), (35, 25)]),
-            f"Revenue {'grew' if g >= 0 else 'shrank'} {abs(g):.0f}% vs the year before.")
-    om = r.get("operatingMargin")
-    if om is not None:
-        add("profit", "Profitability", 20, om, _interp(om, [(-25, 0), (-10, 3), (0, 7), (5, 11), (15, 16), (25, 20)]),
-            f"Keeps {om:.0f}¢ of operating profit per $1 of sales." if om >= 0
-            else f"Loses {abs(om):.0f}¢ on operations per $1 of sales.")
-    fm = r.get("fcfMargin")
-    if fm is not None:
-        add("cash", "Cash generation", 20, fm, _interp(fm, [(-20, 0), (-10, 3), (0, 8), (10, 15), (20, 20)]),
-            f"Turns {fm:.0f}¢ of every sales dollar into free cash." if fm >= 0
-            else f"Burns {abs(fm):.0f}¢ of cash per $1 of sales.")
-    nc, rev, cr = r.get("netCash"), r.get("revenue"), r.get("currentRatio")
-    if nc is not None and rev:
-        lev = -nc / rev  # net debt as a multiple of revenue
-        s1 = _interp(lev, [(0, 12), (0.5, 8), (1, 5), (2, 0)]) if lev > 0 else 12
-        s2 = _interp(cr, [(0.8, 0), (1, 5), (1.5, 8)]) if cr is not None else None
-        score = s1 + s2 if s2 is not None else s1 / 12 * 20
-        why = ("More cash than debt." if nc >= 0 else
-               f"Net debt equal to {lev:.1f}x a year of sales.")
-        fcf = r.get("fcf")
-        if fcf is not None and fcf < 0:
-            runway = max(nc, 0) / -fcf  # years of cash burn covered
-            score *= min(1.0, runway / 3)
-            why += (f" At the current burn, cash lasts about {runway:.1f} years." if runway < 10
-                    else " Cash covers 10+ years of the current burn.")
-        if cr is not None:
-            why += f" Current ratio {cr:.2f}."
-        add("balance", "Balance sheet", 20, round(-lev, 2), score, why)
-    sc = r.get("shareChange")
-    if sc is not None:
-        add("dilution", "Share count", 15, sc, _interp(sc, [(-2, 15), (0, 13), (3, 9), (8, 4), (15, 0)]),
-            f"Shares {'rose' if sc >= 0 else 'fell'} {abs(sc):.1f}% — "
-            + ("your slice of the company shrank." if sc > 1 else
-               "your slice grew (buybacks)." if sc < -1 else "roughly flat."))
-    got = sum(p["score"] for p in parts)
-    mx = sum(p["max"] for p in parts)
-    if mx < 40:
-        return {"score": None, "letter": None, "parts": parts, "coverage": mx}
-    score = round(got / mx * 100)
-    letter = "A" if score >= 80 else "B" if score >= 65 else "C" if score >= 50 else "D" if score >= 35 else "F"
-    return {"score": score, "letter": letter, "parts": parts, "coverage": mx}
-
-
-def flag_and_strengths(f):
-    fy, t, b = f["fy"], f["ttm"], f["balance"]
-    flags, good = f["flags"], f["strengths"]
-    last = fy[-1]
-    g = t.get("revenueGrowth") if t.get("revenueGrowth") is not None else last.get("revenueGrowth")
-    if g is not None:
-        if g < 0:
-            flags.append(f"Revenue shrinking ({g:+.0f}% year over year)")
-        elif g >= 20:
-            good.append(f"Revenue growing {g:.0f}% year over year")
-    if t.get("fcf") is not None:
-        if t["fcf"] < 0:
-            flags.append("Negative free cash flow (trailing 12 months) — burning cash")
-        else:
-            good.append("Positive free cash flow (trailing 12 months)")
-    if t.get("netIncome") is not None and t["netIncome"] < 0:
-        flags.append("Net loss (trailing 12 months)")
-    sc = last.get("shareChange")
-    if sc is not None:
-        if sc > 5:
-            flags.append(f"Share count up {sc:.0f}% last year — dilution")
-        elif sc < -1:
-            good.append(f"Share count down {abs(sc):.0f}% last year — buybacks")
-    if len(fy) >= 2 and fy[-1].get("operatingMargin") is not None and fy[-2].get("operatingMargin") is not None:
-        dm = fy[-1]["operatingMargin"] - fy[-2]["operatingMargin"]
-        if dm <= -3:
-            flags.append(f"Operating margin fell {abs(dm):.0f} points last year")
-        elif dm >= 3:
-            good.append(f"Operating margin up {dm:.0f} points last year")
-    if b:
-        if b.get("netCash") is not None:
-            if b["netCash"] > 0:
-                good.append("More cash than debt")
-            elif b.get("totalDebtYearAgo") is not None and b["totalDebt"] > b["totalDebtYearAgo"] * 1.25:
-                flags.append("Debt exceeds cash and rose 25%+ in a year")
-        cr = b.get("currentRatio")
-        if cr is not None and cr < 1:
-            flags.append(f"Current ratio {cr} — short-term liabilities exceed short-term assets")
-        if b.get("equity") is not None and b["equity"] < 0:
-            flags.append("Negative shareholders' equity")
-    sbc, rev = t.get("sbc"), t.get("revenue")
-    if sbc and rev and sbc / rev > 0.15:
-        flags.append(f"Stock comp is {sbc / rev * 100:.0f}% of revenue")
+    dates = sorted(set(inst["cash"]) | set(inst["equity"]) | set(inst["totalAssets"]))
+    bal = {d: bal_at(d, 0) for d in dates[-6:]}
+    so = _inst(facts, [("dei", "EntityCommonStockSharesOutstanding")], ("shares",))
+    qr = {k: _quarters(rows[k]) for k in ("revenue", "eps", "netIncome")}
+    qends = sorted(set(qr["revenue"]) | set(qr["eps"]))[-9:]
+    quarters = [{"end": e, **{k: qr[k].get(e) for k in qr}} for e in qends]
+    return {"source": "SEC EDGAR", "currency": currency, "fy": fy, "ttm": ttm, "growth": growth, "bal": bal,
+            "quarters": quarters, "shares": so[max(so)] if so else None}
 
 
 def sec_ticker_map():
-    """ticker -> (10-digit CIK, company name). Tries SEC's JSON list, then its plain-text list."""
     errs = []
     try:
         raw = get_json("https://www.sec.gov/files/company_tickers.json", SEC_UA)
         return {v["ticker"].upper(): (str(v["cik_str"]).zfill(10), v["title"]) for v in raw.values()}, None
     except Exception as e:  # noqa: BLE001
-        errs.append(f"company_tickers.json: {e}")
-    try:
-        txt = get("https://www.sec.gov/include/ticker.txt", SEC_UA).decode()
-        m = {}
-        for line in txt.splitlines():
-            t, _, c = line.partition("\t")
-            if t and c.strip().isdigit():
-                m[t.upper()] = (c.strip().zfill(10), None)
-        if m:
-            return m, None
-    except Exception as e:  # noqa: BLE001
-        errs.append(f"ticker.txt: {e}")
+        errs.append(str(e))
     return {}, "; ".join(errs)
 
 
@@ -586,7 +448,469 @@ def sec_facts(cik):
     return get_json(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json", SEC_UA)["facts"]
 
 
-# ---------------------------------------------------------------- news
+# ---------------------------------------------------------------- Yahoo fundamentals feed
+
+Y_FLOW = {  # income + cash flow: annual, quarterly, trailing
+    "revenue": "TotalRevenue", "grossProfit": "GrossProfit", "operatingIncome": "OperatingIncome",
+    "netIncome": "NetIncomeCommonStockholders", "netIncomeAlt": "NetIncome",
+    "operatingCashFlow": "OperatingCashFlow", "capex": "CapitalExpenditure", "sbc": "StockBasedCompensation",
+    "eps": "DilutedEPS", "dilutedShares": "DilutedAverageShares",
+}
+Y_BAL = {  # balance sheet: annual, quarterly
+    "cash": "CashAndCashEquivalents", "sti": "OtherShortTermInvestments",
+    "cashSti": "CashCashEquivalentsAndShortTermInvestments", "totalDebt": "TotalDebt",
+    "equity": "StockholdersEquity", "currentAssets": "CurrentAssets", "currentLiabilities": "CurrentLiabilities",
+    "totalAssets": "TotalAssets", "totalLiabilities": "TotalLiabilitiesNetMinorityInterest",
+    "intangibles": "GoodwillAndOtherIntangibleAssets", "goodwill": "Goodwill",
+    "otherIntangibles": "OtherIntangibleAssets", "sharesOut": "OrdinarySharesNumber",
+}
+
+
+def from_yahoo(sym):
+    types = []
+    for prefix in ("annual", "quarterly", "trailing"):
+        types += [prefix + v for v in Y_FLOW.values()]
+    for prefix in ("annual", "quarterly"):
+        types += [prefix + v for v in Y_BAL.values()]
+    now = int(time.time())
+    url = (f"https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/"
+           f"{urllib.parse.quote(sym)}?symbol={urllib.parse.quote(sym)}&type={','.join(types)}"
+           f"&period1={now - 7 * 365 * 86400}&period2={now}")
+    res = YH.json(url)["timeseries"]["result"]
+    data, currency = {}, None
+    for r in res:
+        t = (r.get("meta", {}).get("type") or [None])[0]
+        for v in r.get(t) or []:
+            if not v or v.get("reportedValue") is None:
+                continue
+            data.setdefault(t, {})[v["asOfDate"]] = v["reportedValue"]["raw"]
+            currency = currency or v.get("currencyCode")
+    if not data:
+        return None
+
+    def series(prefix, key, table):
+        return data.get(prefix + table[key], {})
+
+    def flow(prefix):
+        out = {}
+        for k in Y_FLOW:
+            for d, v in series(prefix, k, Y_FLOW).items():
+                out.setdefault(d, {})[k] = v
+        for d, r in out.items():
+            if r.get("netIncome") is None:
+                r["netIncome"] = r.get("netIncomeAlt")
+            if r.get("capex") is not None:
+                r["capex"] = abs(r["capex"])
+        return out
+
+    def balance(prefix):
+        out = {}
+        for k in Y_BAL:
+            for d, v in series(prefix, k, Y_BAL).items():
+                out.setdefault(d, {})[k] = v
+        res = {}
+        for d, b in out.items():
+            cash, sti = b.get("cash"), b.get("sti")
+            if cash is None and b.get("cashSti") is not None:
+                cash, sti = b["cashSti"], 0
+            intang = b.get("intangibles")
+            if intang is None and (b.get("goodwill") is not None or b.get("otherIntangibles") is not None):
+                intang = (b.get("goodwill") or 0) + (b.get("otherIntangibles") or 0)
+            if intang is None and b.get("totalAssets") is not None:
+                intang = 0
+            tl = b.get("totalLiabilities")
+            if tl is None and b.get("totalAssets") is not None and b.get("equity") is not None:
+                tl = b["totalAssets"] - b["equity"]
+            res[d] = {"cash": cash, "sti": sti, "totalDebt": b.get("totalDebt"), "equity": b.get("equity"),
+                      "currentAssets": b.get("currentAssets"), "currentLiabilities": b.get("currentLiabilities"),
+                      "totalAssets": b.get("totalAssets"), "totalLiabilities": tl, "intangibles": intang,
+                      "_sharesOut": b.get("sharesOut")}
+        return res
+
+    afl, qfl, tfl = flow("annual"), flow("quarterly"), flow("trailing")
+    abal, qbal = balance("annual"), balance("quarterly")
+    ends = sorted(d for d, r in afl.items() if r.get("revenue") is not None or r.get("netIncome") is not None)[-5:]
+    if not ends:
+        return None
+    fy = []
+    for e in ends:
+        row = {"end": e, **{k: afl[e].get(k) for k in Y_FLOW if k != "netIncomeAlt"}}
+        row.update({k: v for k, v in (abal.get(e) or {}).items() if not k.startswith("_")})
+        fy.append(row)
+
+    t_end = max(tfl) if tfl else ends[-1]
+    ttm = {k: (tfl.get(t_end) or {}).get(k) for k in
+           ("revenue", "grossProfit", "operatingIncome", "netIncome", "operatingCashFlow", "capex", "sbc", "eps")}
+    for k in ttm:  # fall back to last fiscal year where trailing is missing
+        if ttm[k] is None:
+            ttm[k] = afl[ends[-1]].get(k)
+    ttm["asOf"] = t_end
+    quarters = [{"end": d, "revenue": r.get("revenue"), "eps": r.get("eps"), "netIncome": r.get("netIncome")}
+                for d, r in sorted(qfl.items())]
+    growth = None
+    if len(quarters) >= 5 and quarters[-5]["revenue"]:
+        growth = pct(quarters[-1]["revenue"], quarters[-5]["revenue"])
+    bal = {**{d: {k: v for k, v in b.items() if not k.startswith("_")} for d, b in abal.items()},
+           **{d: {k: v for k, v in b.items() if not k.startswith("_")} for d, b in qbal.items()}}
+    shares = None
+    for src in (qbal, abal):
+        sd = [d for d, b in src.items() if b.get("_sharesOut")]
+        if sd:
+            shares = src[max(sd)]["_sharesOut"]
+            break
+    return {"source": "Yahoo Finance (from company filings)", "currency": currency or "USD", "fy": fy, "ttm": ttm,
+            "growth": growth, "bal": bal, "quarters": quarters, "shares": shares}
+
+
+# ================================================================ analysis
+
+def derive_balance(b, revenue=None):
+    """Adds ratios to a balance-sheet snapshot."""
+    if not b:
+        return {}
+    b = dict(b)
+    cashlike = None if b.get("cash") is None else (b.get("cash") or 0) + (b.get("sti") or 0)
+    b["cashAndInvestments"] = cashlike
+    b["netCash"] = None if cashlike is None or b.get("totalDebt") is None else cashlike - b["totalDebt"]
+    if b["netCash"] is None and cashlike is not None and b.get("totalDebt") is None:
+        b["netCash"] = cashlike  # no reported borrowings
+    b["currentRatio"] = round(b["currentAssets"] / b["currentLiabilities"], 2) \
+        if b.get("currentAssets") and b.get("currentLiabilities") else None
+    b["liabToAssets"] = round(b["totalLiabilities"] / b["totalAssets"] * 100, 1) \
+        if b.get("totalLiabilities") is not None and b.get("totalAssets") else None
+    b["intangibleShare"] = round(b["intangibles"] / b["totalAssets"] * 100, 1) \
+        if b.get("intangibles") is not None and b.get("totalAssets") else None
+    b["debtToEquity"] = round(b["totalDebt"] / b["equity"], 2) \
+        if b.get("totalDebt") is not None and b.get("equity") and b["equity"] > 0 else None
+    return b
+
+
+def balance_part(b, fcf, bvps_growth):
+    """Balance-sheet part of the grade, built from assets, liabilities and equity."""
+    checks = []
+
+    def add(key, label, weight, value, score, text):
+        checks.append({"key": key, "label": label, "weight": weight, "value": value,
+                       "score": round(score, 3), "text": text})
+
+    la = b.get("liabToAssets")
+    if la is not None:
+        add("liabToAssets", "Liabilities ÷ assets", 0.25, la,
+            _interp(la, [(30, 1), (50, 0.7), (70, 0.35), (90, 0)]),
+            f"{la:.0f}% of what it owns is funded by what it owes.")
+    cr = b.get("currentRatio")
+    if cr is not None:
+        add("currentRatio", "Current ratio", 0.20, cr, _interp(cr, [(0.8, 0), (1, 0.4), (1.5, 0.75), (2, 1)]),
+            f"${cr:.2f} of short-term assets per $1 due within a year.")
+    nc = b.get("netCash")
+    if nc is not None:
+        lev = -nc / b["_revenue"] if b.get("_revenue") and nc < 0 else 0
+        add("netCash", "Net cash", 0.25, nc, 1 if nc >= 0 else _interp(lev, [(0, 1), (0.5, 0.6), (1, 0.3), (2, 0)]),
+            "More cash than debt." if nc >= 0 else f"Net debt equal to {lev:.1f}x a year of sales.")
+    if bvps_growth is not None:
+        add("bvpsGrowth", "Equity per share trend", 0.15, bvps_growth,
+            _interp(bvps_growth, [(-10, 0), (0, 0.4), (10, 0.8), (20, 1)]),
+            f"Book value per share {'grew' if bvps_growth >= 0 else 'fell'} {abs(bvps_growth):.0f}% in a year.")
+    if b.get("equity") is not None and b["equity"] <= 0:
+        add("bvpsGrowth", "Shareholders' equity", 0.15, None, 0, "Equity is negative: liabilities exceed assets.")
+    ish = b.get("intangibleShare")
+    if ish is not None:
+        add("intangibleShare", "Goodwill + intangibles", 0.15, ish,
+            _interp(ish, [(10, 1), (30, 0.6), (50, 0.2), (70, 0)]),
+            f"{ish:.0f}% of assets are goodwill and intangibles.")
+    if not checks:
+        return None
+    tw = sum(c["weight"] for c in checks)
+    r = sum(c["score"] * c["weight"] for c in checks) / tw
+    note = ""
+    if fcf is not None and fcf < 0 and nc is not None:
+        runway = max(nc, 0) / -fcf
+        r *= min(1.0, runway / 3)
+        note = (f" Burning cash: about {runway:.1f} years of runway." if runway < 10 else
+                " Burning cash, but cash covers 10+ years.")
+    return {"ratio": r, "checks": checks, "why": " ".join(c["text"] for c in checks[:2]) + note}
+
+
+def grade(r, b, bvps_growth, weights=WEIGHTS):
+    parts = []
+
+    def add(key, label, value, rat, why, checks=None):
+        p = {"key": key, "label": label, "value": value, "ratio": round(rat, 3), "why": why}
+        if checks:
+            p["checks"] = checks
+        parts.append(p)
+
+    g = r.get("revenueGrowth")
+    if g is not None:
+        add("growth", "Growth", g, _interp(g, [(-10, 0), (0, 0.32), (10, 0.6), (20, 0.8), (35, 1)]),
+            f"Revenue {'grew' if g >= 0 else 'shrank'} {abs(g):.0f}% vs a year earlier.")
+    om = r.get("operatingMargin")
+    if om is not None:
+        add("profit", "Profitability", om, _interp(om, [(-25, 0), (-10, .15), (0, .35), (5, .55), (15, .8), (25, 1)]),
+            f"Keeps {om:.0f}¢ of operating profit per $1 of sales." if om >= 0
+            else f"Loses {abs(om):.0f}¢ on operations per $1 of sales.")
+    fm = r.get("fcfMargin")
+    if fm is not None:
+        add("cash", "Cash generation", fm, _interp(fm, [(-20, 0), (-10, .15), (0, .4), (10, .75), (20, 1)]),
+            f"Turns {fm:.0f}¢ of every sales dollar into free cash." if fm >= 0
+            else f"Burns {abs(fm):.0f}¢ of cash per $1 of sales.")
+    bp = balance_part({**b, "_revenue": r.get("revenue")}, r.get("fcf"), bvps_growth) if b else None
+    if bp:
+        add("balance", "Balance sheet", None, bp["ratio"], bp["why"], bp["checks"])
+    sc = r.get("shareChange")
+    if sc is not None:
+        add("dilution", "Share count", sc, _interp(sc, [(-2, 1), (0, .87), (3, .6), (8, .27), (15, 0)]),
+            f"Shares {'rose' if sc >= 0 else 'fell'} {abs(sc):.1f}% — "
+            + ("your slice of the company shrank." if sc > 1 else
+               "your slice grew (buybacks)." if sc < -1 else "roughly flat."))
+    return score_parts(parts, weights)
+
+
+def score_parts(parts, weights):
+    for p in parts:
+        p["max"] = weights[p["key"]]
+        p["score"] = round(p["ratio"] * p["max"], 1)
+    mx = sum(p["max"] for p in parts)
+    if mx < sum(weights.values()) * 0.4:
+        return {"score": None, "letter": None, "parts": parts, "coverage": mx}
+    score = round(sum(p["score"] for p in parts) / mx * 100)
+    return {"score": score, "letter": letter(score), "parts": parts, "coverage": mx}
+
+
+def letter(s):
+    return "A" if s >= 80 else "B" if s >= 65 else "C" if s >= 50 else "D" if s >= 35 else "F"
+
+
+def analyze(raw, price):
+    fy = raw["fy"]
+    prev = None
+    for row in fy:
+        row["fcf"] = row["operatingCashFlow"] - abs(row["capex"]) \
+            if row.get("operatingCashFlow") is not None and row.get("capex") is not None else None
+        row["revenueGrowth"] = pct(row.get("revenue"), prev.get("revenue")) if prev else None
+        row["shareChange"] = pct(row.get("dilutedShares"), prev.get("dilutedShares")) if prev else None
+        row["epsGrowth"] = pct(row.get("eps"), prev.get("eps")) if prev and (prev.get("eps") or 0) > 0 else None
+        for k, n in (("grossMargin", "grossProfit"), ("operatingMargin", "operatingIncome"),
+                     ("netMargin", "netIncome"), ("fcfMargin", "fcf")):
+            row[k] = ratio(row.get(n), row.get("revenue"))
+        b = derive_balance({k: row.get(k) for k in BAL_KEYS})
+        row.update({k: b.get(k) for k in ("netCash", "currentRatio", "liabToAssets", "intangibleShare",
+                                          "debtToEquity", "cashAndInvestments")})
+        row["bvps"] = row["equity"] / row["dilutedShares"] \
+            if row.get("equity") is not None and row.get("dilutedShares") else None
+        row["bvpsGrowth"] = pct(row["bvps"], prev.get("bvps")) if prev and prev.get("bvps") and row["bvps"] else None
+        avg_eq = [x for x in (row.get("equity"), prev.get("equity") if prev else None) if x]
+        row["roe"] = ratio(row.get("netIncome"), sum(avg_eq) / len(avg_eq)) if avg_eq and sum(avg_eq) > 0 else None
+        row["grade"] = grade(row, b, row["bvpsGrowth"])
+        prev = row
+
+    t = dict(raw["ttm"])
+    t["fcf"] = t["operatingCashFlow"] - abs(t["capex"]) \
+        if t.get("operatingCashFlow") is not None and t.get("capex") is not None else None
+    t["revenueGrowth"] = raw["growth"] if raw["growth"] is not None else fy[-1].get("revenueGrowth")
+    for k, n in (("grossMargin", "grossProfit"), ("operatingMargin", "operatingIncome"),
+                 ("netMargin", "netIncome"), ("fcfMargin", "fcf")):
+        t[k] = ratio(t.get(n), t.get("revenue"))
+
+    bal_dates = sorted(d for d, b in raw["bal"].items() if b.get("totalAssets") or b.get("cash") is not None)
+    latest = derive_balance(raw["bal"][bal_dates[-1]]) if bal_dates else {}
+    if latest:
+        latest["asOf"] = bal_dates[-1]
+        ago = [d for d in bal_dates if 330 <= _days(d, bal_dates[-1]) <= 400]
+        if ago:
+            a = raw["bal"][ago[-1]]
+            latest["totalDebtYearAgo"] = a.get("totalDebt")
+            latest["equityYearAgo"] = a.get("equity")
+    shares = raw.get("shares") or fy[-1].get("dilutedShares")
+    bvps_g = fy[-1].get("bvpsGrowth")
+    if latest.get("equity") and latest.get("equityYearAgo") and latest["equityYearAgo"] > 0:
+        bvps_g = pct(latest["equity"], latest["equityYearAgo"])  # equity trend over the latest 12 months
+        if fy[-1].get("shareChange"):
+            bvps_g = round(((1 + bvps_g / 100) / (1 + fy[-1]["shareChange"] / 100) - 1) * 100, 1)
+    latest["bvpsGrowth"] = bvps_g
+
+    snap = {**t, "shareChange": fy[-1].get("shareChange")}
+    out = {"source": raw["source"], "currency": raw["currency"], "fy": fy, "ttm": t, "balance": latest,
+           "quarters": raw["quarters"], "valuation": {"sharesOutstanding": shares}}
+    out["grade"] = grade(snap, latest, bvps_g)
+    out["grade"]["asOf"] = t.get("asOf")
+
+    v = out["valuation"]
+    if price and shares and raw["currency"] == price.get("currency", "USD"):
+        mc = price["last"] * shares
+        v["marketCap"] = mc
+        if t.get("revenue"):
+            v["priceToSales"] = round(mc / t["revenue"], 1)
+            if latest.get("netCash") is not None:
+                v["evToSales"] = round((mc - latest["netCash"]) / t["revenue"], 1)
+        if t.get("fcf") and t["fcf"] > 0:
+            v["priceToFcf"] = round(mc / t["fcf"], 1)
+        if t.get("netIncome") and t["netIncome"] > 0:
+            v["pe"] = round(mc / t["netIncome"], 1)
+        if latest.get("equity") and latest["equity"] > 0:
+            v["priceToBook"] = round(mc / latest["equity"], 1)
+    flags(out)
+    return out
+
+
+def flags(f):
+    fy, t, b = f["fy"], f["ttm"], f["balance"]
+    bad, good = [], []
+    last = fy[-1]
+    g = t.get("revenueGrowth")
+    if g is not None:
+        if g < 0:
+            bad.append(f"Revenue shrinking ({g:+.0f}% vs a year earlier)")
+        elif g >= 20:
+            good.append(f"Revenue growing {g:.0f}% vs a year earlier")
+    if t.get("fcf") is not None:
+        (bad if t["fcf"] < 0 else good).append(
+            "Negative free cash flow (last 12 months)" if t["fcf"] < 0 else "Positive free cash flow (last 12 months)")
+    if t.get("netIncome") is not None and t["netIncome"] < 0:
+        bad.append("Net loss (last 12 months)")
+    sc = last.get("shareChange")
+    if sc is not None:
+        if sc > 5:
+            bad.append(f"Share count up {sc:.0f}% last year — dilution")
+        elif sc < -1:
+            good.append(f"Share count down {abs(sc):.0f}% last year — buybacks")
+    if len(fy) >= 2 and None not in (fy[-1].get("operatingMargin"), fy[-2].get("operatingMargin")):
+        dm = fy[-1]["operatingMargin"] - fy[-2]["operatingMargin"]
+        if dm <= -3:
+            bad.append(f"Operating margin fell {abs(dm):.0f} points last year")
+        elif dm >= 3:
+            good.append(f"Operating margin up {dm:.0f} points last year")
+    if b:
+        if b.get("netCash") is not None:
+            if b["netCash"] > 0:
+                good.append("More cash than debt")
+            elif b.get("totalDebtYearAgo") and b.get("totalDebt") and b["totalDebt"] > b["totalDebtYearAgo"] * 1.25:
+                bad.append("Debt exceeds cash and rose 25%+ in a year")
+        if b.get("currentRatio") is not None and b["currentRatio"] < 1:
+            bad.append(f"Current ratio {b['currentRatio']} — short-term bills exceed short-term assets")
+        if b.get("equity") is not None and b["equity"] < 0:
+            bad.append("Negative shareholders' equity — liabilities exceed assets")
+        if b.get("liabToAssets") is not None and b["liabToAssets"] > 80 and b.get("currentRatio") is not None:
+            bad.append(f"Liabilities are {b['liabToAssets']:.0f}% of assets")
+        if b.get("intangibleShare") is not None and b["intangibleShare"] > 40:
+            bad.append(f"{b['intangibleShare']:.0f}% of assets are goodwill/intangibles")
+        if b.get("bvpsGrowth") is not None and b["bvpsGrowth"] >= 10:
+            good.append(f"Equity per share up {b['bvpsGrowth']:.0f}% in a year")
+    if t.get("sbc") and t.get("revenue") and t["sbc"] / t["revenue"] > 0.15:
+        bad.append(f"Stock comp is {t['sbc'] / t['revenue'] * 100:.0f}% of revenue")
+    f["flags"], f["strengths"] = bad, good
+
+
+# ================================================================ CAN SLIM
+
+def canslim(price, f, inst, market, spy):
+    L = {}
+
+    def put(k, name, ok, value, why):
+        L[k] = {"name": name, "pass": ok, "value": value, "why": why}
+
+    q = [x for x in (f or {}).get("quarters", []) if x.get("eps") is not None]
+    if len(q) >= 5:
+        cur, ya = q[-1], next((x for x in reversed(q[:-1]) if 355 <= _days(x["end"], q[-1]["end"]) <= 375), None)
+        if ya:
+            e0, e1 = ya["eps"], cur["eps"]
+            g = pct(e1, e0)
+            sg = pct(cur.get("revenue"), ya.get("revenue"))
+            if e1 <= 0:
+                put("C", "Current quarterly earnings", False, e1, f"Lost money last quarter (EPS {e1:.2f}).")
+            elif e0 <= 0:
+                put("C", "Current quarterly earnings", True, None,
+                    f"Turned profitable: EPS {e1:.2f} vs {e0:.2f} a year ago." + (f" Sales {sg:+.0f}%." if sg is not None else ""))
+            else:
+                put("C", "Current quarterly earnings", g >= 25, g,
+                    f"Quarterly EPS {g:+.0f}% vs a year ago (needs +25%)." + (f" Sales {sg:+.0f}%." if sg is not None else ""))
+    if "C" not in L:
+        put("C", "Current quarterly earnings", None, None, "Not enough quarterly data.")
+
+    fy = (f or {}).get("fy", [])
+    eg = [x["epsGrowth"] for x in fy[-3:] if x.get("epsGrowth") is not None]
+    roe = fy[-1].get("roe") if fy else None
+    if len(eg) >= 2:
+        ok = all(x >= 25 for x in eg) and (roe is None or roe >= 17)
+        put("A", "Annual earnings growth", ok, min(eg),
+            f"Yearly EPS growth: {', '.join(f'{x:+.0f}%' for x in eg)} (needs +25% each)."
+            + (f" ROE {roe:.0f}% (needs 17%)." if roe is not None else ""))
+    else:
+        put("A", "Annual earnings growth", False if fy and (fy[-1].get("eps") or 0) <= 0 else None, None,
+            "Not consistently profitable yet." if fy and (fy[-1].get("eps") or 0) <= 0 else "Not enough yearly data.")
+
+    if price:
+        off = round((1 - price["last"] / price["hi52"]) * 100, 1) if price.get("hi52") else None
+        put("N", "New highs", off is not None and off <= 15, off,
+            f"{off:.0f}% below its 52-week high (look for within ~15%). The 'new product or leadership' part is your call."
+            if off is not None else "No price data.")
+        sc = fy[-1].get("shareChange") if fy else None
+        ud = price.get("upDownVol50")
+        bits = []
+        if ud is not None:
+            bits.append(f"up-day volume is {ud:.2f}x down-day volume over 50 days")
+        if sc is not None:
+            bits.append(f"shares {sc:+.1f}% last year")
+        put("S", "Supply and demand", (ud is None or ud >= 1) and (sc is None or sc <= 3) if bits else None, ud,
+            (bits[0][0].upper() + "; ".join(bits)[1:] + ".") if bits else "No data.")
+        rs, spy_rs = rs_weighted(price), rs_weighted(spy)
+        if rs is not None and spy_rs is not None:
+            put("L", "Leader (relative strength)", rs - spy_rs >= 10, round(rs - spy_rs, 1),
+                f"Weighted 12-month return {rs:+.0f}% vs S&P 500 {spy_rs:+.0f}% (look for 10+ points ahead).")
+        else:
+            put("L", "Leader (relative strength)", None, None, "Not enough price history.")
+    if inst and inst.get("pct") is not None:
+        chg = inst.get("change")
+        txt = f"{inst['pct']:.0f}% held by {inst.get('count') or '?'} institutions."
+        txt += f" {chg:+.1f} pts since {inst['since']}." if chg is not None else " Change builds up as daily data accumulates; check Finviz 'Inst Trans' meanwhile."
+        ok = inst["pct"] >= 30 and (chg is None or chg >= 0)
+        if inst["pct"] > 95:
+            txt += " Very crowded: little room for new buyers."
+        put("I", "Institutional sponsorship", ok, inst["pct"], txt)
+    else:
+        put("I", "Institutional sponsorship", None, None, "No ownership data.")
+    if market:
+        put("M", "Market direction", market["state"] == "uptrend", None, market["why"])
+    return L
+
+
+def market_direction(spy):
+    if not spy or spy.get("ma200") is None:
+        return None
+    p, m50, m200 = spy["last"], spy["ma50"], spy["ma200"]
+    if p > m50 > m200:
+        state, why = "uptrend", "S&P 500 is above its 50- and 200-day averages: uptrend."
+    elif p < m200:
+        state, why = "downtrend", "S&P 500 is below its 200-day average: downtrend. O'Neil avoids new buys here."
+    else:
+        state, why = "pressure", "S&P 500 is mixed around its averages: uptrend under pressure."
+    return {"state": state, "why": why, "spy": p, "ma50": m50, "ma200": m200}
+
+
+# ================================================================ institutions
+
+def institutions(sym, prev):
+    url = (f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{urllib.parse.quote(sym)}"
+           f"?modules=majorHoldersBreakdown")
+    r = YH.json(url)["quoteSummary"]["result"][0]["majorHoldersBreakdown"]
+    pct_held = (r.get("institutionsPercentHeld") or {}).get("raw")
+    count = (r.get("institutionsCount") or {}).get("raw")
+    if pct_held is None:
+        return prev
+    hist = list((prev or {}).get("history", []))
+    today = date.today().isoformat()
+    if not hist or hist[-1]["pct"] != round(pct_held * 100, 2):
+        hist.append({"date": today, "pct": round(pct_held * 100, 2), "count": count})
+    hist = hist[-24:]
+    out = {"pct": round(pct_held * 100, 2), "count": count, "history": hist, "asOf": today}
+    base = [h for h in hist if _days(h["date"], today) >= 80]
+    if base:
+        out["change"] = round(out["pct"] - base[-1]["pct"], 2)
+        out["since"] = base[-1]["date"]
+    return out
+
+
+# ================================================================ news
 
 def _clean(s):
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", s or "")).strip()
@@ -594,17 +918,14 @@ def _clean(s):
 
 def parse_rss(xml_bytes, default_source):
     items = []
-    root = ET.fromstring(xml_bytes)
-    for it in root.iter("item"):
-        title = _clean(it.findtext("title"))
-        link = (it.findtext("link") or "").strip()
-        pub = it.findtext("pubDate")
+    for it in ET.fromstring(xml_bytes).iter("item"):
+        title, link = _clean(it.findtext("title")), (it.findtext("link") or "").strip()
         src_el = it.find("source")
         source = _clean(src_el.text) if src_el is not None and src_el.text else default_source
         if source and title.endswith(" - " + source):
             title = title[: -len(source) - 3]
         try:
-            dt = parsedate_to_datetime(pub).astimezone(timezone.utc).isoformat() if pub else None
+            dt = parsedate_to_datetime(it.findtext("pubDate")).astimezone(timezone.utc).isoformat()
         except Exception:  # noqa: BLE001
             dt = None
         if title and link:
@@ -627,9 +948,8 @@ def fetch_news(sym, company):
         errs.append(f"yahoo: {e}")
     q = f'"{short_name(company)}" OR "{sym} stock"' if company else f"{sym} stock"
     try:
-        url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
-            {"q": q + " when:14d", "hl": "en-US", "gl": "US", "ceid": "US:en"})
-        items += parse_rss(get(url), "Google News")
+        items += parse_rss(get("https://news.google.com/rss/search?" + urllib.parse.urlencode(
+            {"q": q + " when:14d", "hl": "en-US", "gl": "US", "ceid": "US:en"})), "Google News")
     except Exception as e:  # noqa: BLE001
         errs.append(f"google: {e}")
     seen, out = set(), []
@@ -643,7 +963,16 @@ def fetch_news(sym, company):
     return out[:20], ("; ".join(errs) if errs and not out else None)
 
 
-# ---------------------------------------------------------------- main
+def yahoo_name(sym):
+    try:
+        r = YH.json(f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{sym}?modules=price")
+        p = r["quoteSummary"]["result"][0]["price"]
+        return p.get("longName") or p.get("shortName"), p.get("quoteType")
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+# ================================================================ main
 
 def main():
     with open(TICKERS_FILE) as fh:
@@ -654,55 +983,83 @@ def main():
     except Exception:  # noqa: BLE001
         old = {}
 
-    # CIKs never change, so remember the ones we've already resolved
-    known = {s: (r.get("cik"), r.get("name")) for s, r in old.items() if r.get("cik")}
     tmap, sec_err = sec_ticker_map()
+    sec_ok = bool(tmap)
     if sec_err:
-        print("SEC ticker list failed:", sec_err, file=sys.stderr)
-    meta = {"secTickerList": "ok" if tmap else sec_err}
+        print("SEC unavailable, using Yahoo fundamentals:", sec_err, file=sys.stderr)
+    spy, _ = fetch_price("SPY")
+    market = market_direction(spy)
+    meta = {"sec": "ok" if sec_ok else sec_err, "market": market,
+            "spy": {k: spy.get(k) for k in ("last", "ret3m", "ret6m", "ret9m", "ret12m")} if spy else None,
+            "weights": WEIGHTS}
 
     out = {}
     for sym in tickers:
         prev = old.get(sym, {})
         rec = {"symbol": sym, "errors": {}}
-        cik, title = tmap.get(sym) or known.get(sym) or (None, None)
-        if tmap.get(sym) and not tmap[sym][1]:
-            title = (known.get(sym) or (None, None))[1]
-        rec["cik"], rec["name"] = cik, title
+        cik, name = tmap.get(sym) or (prev.get("cik"), prev.get("name"))
+        qtype = prev.get("quoteType")
+        if not name or not qtype:
+            n, qtype = yahoo_name(sym)
+            name = name or n
+        rec.update({"cik": cik, "name": name, "quoteType": qtype})
 
         price, err = fetch_price(sym)
         rec["price"] = price or prev.get("price")
         if err and not price:
             rec["errors"]["price"] = err
 
-        if cik:
+        raw, ferr = None, []
+        if qtype in ("ETF", "MUTUALFUND", "INDEX"):
+            ferr.append("Fund/ETF: no company financials to grade")
+        else:
+            if sec_ok and cik:
+                try:
+                    raw = from_sec(sec_facts(cik))
+                except Exception as e:  # noqa: BLE001
+                    ferr.append(f"SEC: {e}")
+                time.sleep(0.25)
+            if raw is None:
+                try:
+                    raw = from_yahoo(sym)
+                    if raw is None:
+                        ferr.append("Yahoo: no financial statements returned")
+                except Exception as e:  # noqa: BLE001
+                    ferr.append(f"Yahoo: {e}")
+        if raw:
             try:
-                rec["fundamentals"] = fundamentals(sec_facts(cik), rec["price"])
-                if rec["fundamentals"] is None:
-                    rec["errors"]["fundamentals"] = "No annual financials in SEC filings yet"
+                rec["fundamentals"] = analyze(raw, rec["price"])
             except Exception as e:  # noqa: BLE001
                 rec["fundamentals"] = prev.get("fundamentals")
-                rec["errors"]["fundamentals"] = f"SEC filings request failed: {e}"
-                print(f"{sym} SEC facts failed: {e}", file=sys.stderr)
-            time.sleep(0.25)
+                rec["errors"]["fundamentals"] = f"Analysis failed: {type(e).__name__}: {e}"
         else:
-            rec["fundamentals"] = prev.get("fundamentals")
-            rec["errors"]["fundamentals"] = ("Not in SEC company list (ETF, fund, or foreign listing)" if tmap
-                                             else f"Couldn't load SEC company list: {sec_err}")
+            rec["fundamentals"] = None if qtype in ("ETF", "MUTUALFUND") else prev.get("fundamentals")
+            rec["errors"]["fundamentals"] = "; ".join(ferr)
 
-        news, err = fetch_news(sym, title)
+        try:
+            rec["institutions"] = institutions(sym, prev.get("institutions"))
+        except Exception as e:  # noqa: BLE001
+            rec["institutions"] = prev.get("institutions")
+            rec["errors"]["institutions"] = str(e)
+
+        rec["canslim"] = canslim(rec["price"], rec.get("fundamentals"), rec.get("institutions"), market, spy) \
+            if qtype not in ("ETF", "MUTUALFUND") else None
+
+        news, err = fetch_news(sym, name)
         rec["news"] = news or prev.get("news", [])
         if err:
             rec["errors"]["news"] = err
         if not rec["errors"]:
             del rec["errors"]
         out[sym] = rec
-        print(f"{sym}: price={'ok' if rec['price'] else 'none'} "
-              f"fund={'ok' if rec.get('fundamentals') else 'none'} news={len(rec['news'])}")
+        f = rec.get("fundamentals") or {}
+        print(f"{sym}: price={'ok' if rec['price'] else 'none'} fund={f.get('source', 'none')} "
+              f"grade={(f.get('grade') or {}).get('letter')} news={len(rec['news'])} "
+              f"errors={rec.get('errors', {})}")
 
     with open(OUT_FILE, "w") as fh:
-        json.dump({"generated": datetime.now(timezone.utc).isoformat(timespec="seconds"), "meta": meta, "tickers": out},
-                  fh, separators=(",", ":"))
+        json.dump({"generated": datetime.now(timezone.utc).isoformat(timespec="seconds"), "meta": meta,
+                   "tickers": out}, fh, separators=(",", ":"))
 
 
 if __name__ == "__main__":

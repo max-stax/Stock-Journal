@@ -4,9 +4,12 @@
    Your journal lives in this browser and, if you add a token, syncs to a private repo. */
 
 const CFG_KEY = "sj.cfg", J_KEY = "sj.journal";
-const DEFAULT_CFG = { owner: "max-stax", appRepo: "Stock-Journal", dataRepo: "Stock-Journal-data", token: "", learn: true };
+const DEFAULT_WEIGHTS = { growth: 20, profit: 20, cash: 20, balance: 25, dilution: 15 };
+const PART_LABELS = { growth: "Growth", profit: "Profitability", cash: "Cash generation", balance: "Balance sheet", dilution: "Share count" };
+const DEFAULT_CFG = { owner: "max-stax", appRepo: "Stock-Journal", dataRepo: "Stock-Journal-data", token: "", learn: true, weights: DEFAULT_WEIGHTS };
 
 let cfg = Object.assign({}, DEFAULT_CFG, readLS(CFG_KEY) || {});
+cfg.weights = Object.assign({}, DEFAULT_WEIGHTS, cfg.weights || {});
 let J = readLS(J_KEY) || newJournal();
 let M = { generated: null, tickers: {} };   // market.json
 let LIST = [];                               // tickers.json entries
@@ -63,9 +66,26 @@ function ctxFor(sym) {
     ni: t.netIncome, fcf: t.fcf, fm: t.fcfMargin, sbc: t.sbc, nc: b.netCash, cr: b.currentRatio, de: b.debtToEquity,
     sc: last.shareChange, mc: v.marketCap, ps: v.priceToSales, evs: v.evToSales, pfcf: v.priceToFcf, pe: v.pe,
     gradeScore: f.grade?.score, gradeLetter: f.grade?.letter,
+    ta: b.totalAssets, tl: b.totalLiabilities, eq: b.equity, la: b.liabToAssets, ish: b.intangibleShare,
+    bvg: b.bvpsGrowth, roe: last.roe, pb: v.priceToBook, eps: t.eps,
   };
 }
 function shortName(n) { return (n || "").replace(/[,.]?\s+(inc|corp|corporation|holdings|group|ltd|plc|n\.?v|co|company)\.?$/i, "").replace(/\b\w+/g, w => w.length > 3 && w === w.toUpperCase() ? w[0] + w.slice(1).toLowerCase() : w); }
+
+// Grades arrive with each part's 0–1 ratio; the score is re-weighted here with your weights.
+const letterOf = s => s == null ? null : s >= 80 ? "A" : s >= 65 ? "B" : s >= 50 ? "C" : s >= 35 ? "D" : "F";
+function regrade(g) {
+  if (!g?.parts) return;
+  const w = cfg.weights, total = Object.values(w).reduce((a, b) => a + b, 0);
+  g.parts.forEach(p => { p.max = w[p.key] ?? 0; p.score = (p.ratio ?? 0) * p.max; });
+  const mx = g.parts.reduce((a, p) => a + p.max, 0);
+  g.coverage = mx; g.coveragePct = total ? mx / total : 0;
+  g.score = mx >= total * 0.4 && mx > 0 ? Math.round(g.parts.reduce((a, p) => a + p.score, 0) / mx * 100) : null;
+  g.letter = letterOf(g.score);
+}
+function applyWeights() {
+  Object.values(M.tickers || {}).forEach(r => { const f = r.fundamentals; if (!f) return; regrade(f.grade); (f.fy || []).forEach(x => regrade(x.grade)); });
+}
 
 // ------------------------------------------------------------ persistence + sync
 let pushTimer = null;
@@ -218,14 +238,16 @@ function viewStocks() {
   const syms = symbols().filter(s => f === "all" || (f === "due" ? reviewDue(J.stocks[s]) : (J.stocks[s]?.status || "watching") === f));
   const counts = { owned: 0, watching: 0, passed: 0, due: 0 };
   symbols().forEach(s => { counts[J.stocks[s]?.status || "watching"]++; if (reviewDue(J.stocks[s])) counts.due++; });
-  return `<div class="filters">${[["all", "All"], ["owned", "Owned"], ["watching", "Watching"], ["due", "Review due"], ["passed", "Passed"]]
+  const mk = M.meta?.market;
+  const banner = mk ? `<div class="flag ${mk.state === "uptrend" ? "good" : "bad"}" style="margin-bottom:12px">Market: ${esc(mk.why)}</div>` : "";
+  return `${banner}<div class="filters">${[["all", "All"], ["owned", "Owned"], ["watching", "Watching"], ["due", "Review due"], ["passed", "Passed"]]
       .map(([k, l]) => `<button class="${f === k ? "on" : ""}" data-act="filter" data-v="${k}">${l}${k !== "all" ? ` ${counts[k]}` : ""}</button>`).join("")}</div>
     <div class="card"><div class="rows">${syms.map(s => {
       const r = rec(s), st = J.stocks[s], g = r.fundamentals?.grade, hasThesis = st?.thesis?.why;
       return `<div class="row" data-act="open" data-v="${s}">
         <div><div class="sym">${s} <span class="grade ${gClass(g?.letter)}" title="Health grade">${g?.letter || "–"}</span>
           ${st?.status === "owned" ? `<span class="chip owned">owned</span>` : ""}${reviewDue(st) ? `<span class="chip due">review</span>` : ""}</div>
-          <div class="sub">${esc(shortName(r.name) || "")}${hasThesis ? "" : ` · <span class="t2">no thesis yet</span>`}</div></div>
+          <div class="sub">${esc(shortName(r.name) || "")}${r.canslim ? ` · CAN SLIM ${["C","A","N","S","L","I","M"].filter(k => r.canslim[k]?.pass === true).length}/7` : ""}${hasThesis ? "" : ` · <span class="t2">no thesis yet</span>`}</div></div>
         <div class="right"><div class="num">${r.price ? money(r.price.last) : "—"}</div><div class="sub num ${cls(r.price?.changePct)}">${pct(r.price?.changePct)}</div></div></div>`;
     }).join("") || `<div class="empty">Nothing here.</div>`}</div></div>
     <button class="btn ghost block" data-act="addTicker">+ Add a stock</button>`;
@@ -239,11 +261,12 @@ function kvRow(label, val, key, sym, valCls = "") {
 
 function viewDetail(sym) {
   const r = rec(sym), st = stock(sym), p = r.price, h = J.holdings[sym], co = callout(sym), g = r.fundamentals?.grade;
-  const subs = [["thesis", "Thesis"], ["health", "Health"], ["numbers", "Numbers"], ["journal", "Journal"], ["news", "News"]];
+  const subs = [["thesis", "Thesis"], ["health", "Health"], ["canslim", "CAN SLIM"], ["numbers", "Numbers"], ["journal", "Journal"], ["news", "News"]];
   let body = "";
   if (ui.sub === "thesis") body = subThesis(sym, st, co);
   else if (ui.sub === "health") body = subHealth(sym);
   else if (ui.sub === "numbers") body = subNumbers(sym);
+  else if (ui.sub === "canslim") body = subCanslim(sym);
   else if (ui.sub === "journal") body = subJournal(sym, st);
   else body = subNews(r);
   return `<div class="dhead"><div><div class="t2">${esc(r.name || "")}</div>
@@ -285,10 +308,11 @@ function subHealth(sym) {
     <div class="card"><h2>Health grade ${learnQ("grade")}<span class="sp"></span><span class="mute" style="text-transform:none;letter-spacing:0">latest 12 mo</span></h2>
       <div class="stack" style="margin-bottom:6px"><span class="grade lg ${gClass(g.letter)}">${g.letter || "–"}</span>
       <div><div class="big num">${g.score ?? "—"}<span class="mute" style="font-size:14px"> / 100</span></div>
-      <div class="mute" style="font-size:12px">${g.coverage < 100 ? `Based on ${g.parts.length} of 5 parts` : "All 5 parts"}</div></div></div>
+      <div class="mute" style="font-size:12px">${g.parts.length < 5 ? `Based on ${g.parts.length} of 5 parts` : "All 5 parts"}</div></div></div>
       ${g.parts.map(p => `<div class="part"><div>${p.label}</div><div class="num">${p.score.toFixed(0)}<span class="mute">/${p.max}</span></div>
         <div class="pb"><i style="width:${p.score / p.max * 100}%;background:${p.score / p.max >= .7 ? "var(--pos)" : p.score / p.max >= .4 ? "var(--warn)" : "var(--neg)"}"></i></div>
-        <div class="why">${esc(p.why)}</div></div>`).join("")}</div>
+        <div class="why">${esc(p.why)}</div>${p.checks ? balanceChecks(p.checks) : ""}</div>`).join("")}
+      <p class="mute" style="font-size:12px;margin:8px 0 0">Weights: ${Object.entries(cfg.weights).map(([k, v]) => `${PART_LABELS[k]} ${v}`).join(" · ")}. <a href="#" data-act="tab" data-v="settings">Change</a></p></div>
     <div class="card"><h2>What stands out</h2>
       ${f.flags.map(x => `<div class="flag bad">${esc(x)}</div>`).join("")}${f.strengths.map(x => `<div class="flag good">${esc(x)}</div>`).join("")}
       ${!f.flags.length && !f.strengths.length ? `<p class="mute">Nothing notable either way.</p>` : ""}</div>
@@ -320,7 +344,8 @@ function subNumbers(sym) {
       ${kvRow("Price / sales", v.priceToSales ?? "—", "priceToSales", sym)}
       ${kvRow("EV / sales", v.evToSales ?? "—", "evToSales", sym)}
       ${kvRow("Price / free cash flow", v.priceToFcf ?? "n/a", "priceToFcf", sym)}
-      ${kvRow("P/E", v.pe ?? "n/a", "pe", sym)}</div></div>
+      ${kvRow("P/E", v.pe ?? "n/a", "pe", sym)}
+      ${kvRow("Price / book", v.priceToBook ?? "n/a", "priceToBook", sym)}</div></div>
     <div class="card"><h2>Last 12 months ${learnQ("ttm")}<span class="sp"></span><span class="mute" style="text-transform:none;letter-spacing:0">through ${fmtDate(t.asOf)}</span></h2><div class="kv">
       ${kvRow("Revenue", money(t.revenue), "revenue", sym)}
       ${kvRow("Revenue growth", pct(t.revenueGrowth), "growth", sym, cls(t.revenueGrowth))}
@@ -330,13 +355,20 @@ function subNumbers(sym) {
       ${kvRow("Free cash flow", money(t.fcf), "fcf", sym, cls(t.fcf))}
       ${kvRow("FCF margin", pct(t.fcfMargin, 1, false), "fcfMargin", sym)}
       ${kvRow("Stock comp", money(t.sbc), "sbc", sym)}</div></div>
-    <div class="card"><h2>Balance sheet<span class="sp"></span><span class="mute" style="text-transform:none;letter-spacing:0">${fmtDate(b.asOf)}</span></h2><div class="kv">
+    <div class="card"><h2>Balance sheet ${learnQ("balanceSheet")}<span class="sp"></span><span class="mute" style="text-transform:none;letter-spacing:0">${fmtDate(b.asOf)}</span></h2>
+      ${aleBar(b)}
+      <div class="kv">
+      ${kvRow("Total assets", money(b.totalAssets), "totalAssets", sym)}
+      ${kvRow("Total liabilities", money(b.totalLiabilities), "totalLiabilities", sym)}
+      ${kvRow("Shareholders' equity", money(b.equity), "equity", sym, cls(b.equity))}
+      ${kvRow("Liabilities ÷ assets", pct(b.liabToAssets, 0, false), "liabToAssets", sym)}
+      ${kvRow("Goodwill + intangibles", pct(b.intangibleShare, 0, false) + " of assets", "intangibleShare", sym)}
+      ${kvRow("Equity per share, 1 yr", pct(b.bvpsGrowth, 0), "bvpsGrowth", sym, cls(b.bvpsGrowth))}
       ${kvRow("Cash + investments", money(b.cashAndInvestments))}
       ${kvRow("Total debt", money(b.totalDebt))}
       ${kvRow("Net cash", money(b.netCash), "netCash", sym, cls(b.netCash))}
       ${kvRow("Current ratio", b.currentRatio ?? "—", "currentRatio", sym)}
-      ${kvRow("Debt / equity", b.debtToEquity ?? "—", "debtToEquity", sym)}
-      ${kvRow("Shareholders' equity", money(b.equity))}</div></div>
+      ${kvRow("Debt / equity", b.debtToEquity ?? "—", "debtToEquity", sym)}</div></div>
     <div class="card"><h2>By fiscal year</h2><div class="tbl"><table>
       <thead><tr><th></th>${f.fy.map(x => `<th>FY${x.end.slice(2, 4)}</th>`).join("")}</tr></thead><tbody>
       ${row("Grade", "grade", x => x.grade?.letter ? `<span class="grade ${gClass(x.grade.letter)}">${x.grade.letter}</span>` : "–")}
@@ -347,8 +379,44 @@ function subNumbers(sym) {
       ${row("Net income", "netIncome", x => money(x.netIncome))}
       ${row("Free cash flow", "fcf", x => `<span class="${cls(x.fcf)}">${money(x.fcf)}</span>`)}
       ${row("Share change", "shareChange", x => pct(x.shareChange))}
+      ${row("Diluted EPS", "eps", x => x.eps != null ? (x.eps < 0 ? "−$" : "$") + Math.abs(x.eps).toFixed(2) : "—")}
+      ${row("ROE", "roe", x => pct(x.roe, 0, false))}
       ${row("Net cash", "netCash", x => money(x.netCash))}
-      </tbody></table></div><p class="mute" style="font-size:12px;margin:8px 0 0">From ${esc(rec(sym).name || sym)}'s SEC filings${f.currency && f.currency !== "USD" ? ` (in ${f.currency})` : ""}.</p></div>`;
+      ${row("Liab. ÷ assets", "liabToAssets", x => pct(x.liabToAssets, 0, false))}
+      ${row("Equity/share", "bvpsGrowth", x => pct(x.bvpsGrowth, 0))}
+      </tbody></table></div><p class="mute" style="font-size:12px;margin:8px 0 0">Source: ${esc(f.source || "SEC filings")}${f.currency && f.currency !== "USD" ? ` (in ${f.currency})` : ""}.</p></div>`;
+}
+
+function aleBar(b) {
+  // Assets = Liabilities + Equity, drawn to scale
+  if (!b.totalAssets || b.totalLiabilities == null) return "";
+  const L = Math.max(0, Math.min(100, b.totalLiabilities / b.totalAssets * 100)), E = 100 - L;
+  return `<div style="margin:2px 0 12px"><div class="mute" style="font-size:12px;margin-bottom:4px">Assets = Liabilities + Equity</div>
+    <div style="display:flex;height:22px;border-radius:6px;overflow:hidden;font-size:11px;font-family:var(--mono)">
+      <div style="width:${L}%;background:color-mix(in srgb,var(--neg) 55%,transparent);display:grid;place-items:center">${L >= 18 ? `Owes ${L.toFixed(0)}%` : ""}</div>
+      <div style="width:${E}%;background:color-mix(in srgb,var(--pos) 55%,transparent);display:grid;place-items:center">${E >= 18 ? `Owns ${E.toFixed(0)}%` : ""}</div></div>
+    <div class="mute" style="font-size:11.5px;margin-top:4px">Of ${money(b.totalAssets)} in assets, ${money(b.totalLiabilities)} is owed to others and ${money(b.equity)} belongs to shareholders.</div></div>`;
+}
+
+function balanceChecks(checks) {
+  return `<div style="grid-column:1/-1;margin-top:6px">${checks.map(c => `<div class="stack" style="font-size:12.5px;padding:3px 0;flex-wrap:nowrap">
+    <span style="width:8px;height:8px;border-radius:50%;flex:none;background:${c.score >= .7 ? "var(--pos)" : c.score >= .4 ? "var(--warn)" : "var(--neg)"}"></span>
+    <span style="flex:1">${esc(c.label)} ${learnQ(c.key)}</span><span class="mute">${esc(c.text)}</span></div>`).join("")}</div>`;
+}
+
+function subCanslim(sym) {
+  const r = rec(sym), cs = r.canslim, mk = M.meta?.market;
+  if (!cs) return `<div class="card empty">${r.quoteType === "ETF" ? "CAN SLIM applies to individual companies, not ETFs." : "No CAN SLIM data yet. It appears after the next daily update."}</div>`;
+  const order = ["C", "A", "N", "S", "L", "I", "M"], passed = order.filter(k => cs[k]?.pass === true).length;
+  const known = order.filter(k => cs[k]?.pass != null).length;
+  return `<div class="card"><h2>CAN SLIM ${learnQ("canslim")}<span class="sp"></span><span class="num" style="text-transform:none;letter-spacing:0;color:var(--text)">${passed} / ${known} pass</span></h2>
+    ${order.map(k => { const x = cs[k] || {}; const st = x.pass === true ? "pos" : x.pass === false ? "neg" : "mute";
+      return `<div class="part" style="grid-template-columns:auto 1fr auto"><span class="grade" style="background:var(--${st === "mute" ? "panel-2" : st});color:${st === "mute" ? "var(--mute)" : "#0b0d0f"}">${k}</span>
+        <div>${esc(x.name || k)} ${learnQ("cs" + k)}</div><div class="${st}" style="font-weight:600">${x.pass === true ? "Pass" : x.pass === false ? "Fail" : "—"}</div>
+        <div class="why">${esc(x.why || "")}</div></div>`; }).join("")}
+    <p class="mute" style="font-size:12px;margin:8px 0 0">L is an approximation of IBD's Relative Strength rating (compares to the S&P 500, not every stock). I's change builds up over time from daily snapshots.</p></div>
+    ${mk ? `<div class="card"><h2>Market (M)</h2><div class="kv">${kvRow("S&P 500", money(mk.spy))}${kvRow("50-day average", money(mk.ma50))}${kvRow("200-day average", money(mk.ma200))}</div></div>` : ""}
+    <div class="card"><h2>How CAN SLIM and the health grade differ</h2><p class="t2" style="margin:0">The health grade asks “is this a sound business?” CAN SLIM asks “is this the right stock to buy now?” A stock can score A on health and fail CAN SLIM (great business, weak price action), or the reverse. O'Neil also cuts any loss at 7–8% — write in your thesis which rulebook governs this position.</p></div>`;
 }
 
 function subJournal(sym, st) {
@@ -372,8 +440,9 @@ function viewLearn() {
   return `<div class="card"><p style="margin-top:0">Every number in the app has a <span class="q" style="display:inline-grid">?</span> next to it. Tap it for what the number means, what good and bad look like, and the common traps.</p>
     <p>On any stock's <b>Health</b> tab, “Walk me through” goes step by step through that company's actual numbers, in the order an analyst would read them.</p>
     <label class="stack" style="margin:0"><input type="checkbox" data-act="toggleLearn" ${cfg.learn ? "checked" : ""}> Show one-line explanations under each number</label></div>
-    ${[["Reading the business", ["revenue", "growth", "grossMargin", "operatingMargin", "netIncome"]], ["Cash", ["fcf", "fcfMargin", "sbc"]],
-      ["Balance sheet", ["netCash", "currentRatio", "debtToEquity", "shareChange"]], ["Valuation", ["marketCap", "priceToSales", "evToSales", "priceToFcf", "pe"]],
+    ${[["Reading the business", ["revenue", "growth", "grossMargin", "operatingMargin", "netIncome", "eps"]], ["Cash", ["fcf", "fcfMargin", "sbc"]],
+      ["Balance sheet", ["balanceSheet", "totalAssets", "totalLiabilities", "equity", "liabToAssets", "netCash", "currentRatio", "intangibleShare", "bvpsGrowth", "debtToEquity", "shareChange"]],
+      ["Valuation", ["marketCap", "priceToSales", "evToSales", "priceToFcf", "pe", "priceToBook"]], ["CAN SLIM", ["canslim", "csC", "csA", "csN", "csS", "csL", "csI", "csM", "eps", "roe"]],
       ["This app", ["grade", "gradeVsPrice", "ttm"]]]
       .map(([h, keys]) => `<div class="card"><h2>${h}</h2><div class="rows">${keys.map(k => `<div class="row" data-act="learn" data-v="${k}"><div><div>${LEARN[k].title}</div><div class="sub">${esc(LEARN[k].what)}</div></div><div class="mute">›</div></div>`).join("")}</div></div>`).join("")}`;
 }
@@ -384,13 +453,19 @@ function viewSettings() {
     <label class="f"><span>GitHub token</span><input type="password" id="tok" value="${esc(cfg.token)}" placeholder="github_pat_…" autocomplete="off">
       <small>Fine-grained token with “Contents: read and write” on ${esc(cfg.appRepo)} and ${esc(cfg.dataRepo)} only. Stored only on this device.</small></label>
     <div class="stack"><button class="btn" data-act="saveTok">Save &amp; sync</button><span class="sync" id="sync2">${esc(ui.syncState)}</span></div></div>
+    <div class="card"><h2>Grade weights</h2>
+      <p class="t2" style="margin-top:0">How much each part counts toward the health grade. Changes apply to every stock and every year, so you can see how the grade-vs-price results shift.</p>
+      ${Object.entries(cfg.weights).map(([k, v]) => `<label class="f"><span>${PART_LABELS[k]} <span class="num" id="wv-${k}">${v}</span></span>
+        <input type="range" min="0" max="40" step="5" value="${v}" data-act="weight" data-k="${k}" style="width:100%"></label>`).join("")}
+      <div class="stack"><span class="mute" id="wtotal">Total ${Object.values(cfg.weights).reduce((a, b) => a + b, 0)} (scores are scaled to 100 either way)</span>
+      <button class="btn ghost sm" data-act="resetWeights" style="margin-left:auto">Reset</button></div></div>
     <div class="card"><h2>Import from Fidelity</h2>
       <p class="t2" style="margin-top:0">Fidelity → Positions → Download (the ↓ icon). Pick the CSV here. You'll choose which account to import.</p>
       <input type="file" accept=".csv,text/csv" data-act="csv"></div>
     <div class="card"><h2>Backup</h2><div class="stack">
       <button class="btn ghost" data-act="export">Export journal</button>
       <label class="btn ghost" style="cursor:pointer">Import backup<input type="file" accept=".json" data-act="importJson" hidden></label></div></div>
-    <div class="card"><h2>About the data</h2><p class="t2" style="margin:0">Prices: Yahoo Finance (Stooq fallback). Financials: SEC EDGAR filings. News: Yahoo Finance and Google News. Updated each weekday after the close. ${M.generated ? `Last update ${rel(M.generated)}.` : ""}</p></div>`;
+    <div class="card"><h2>About the data</h2><p class="t2" style="margin:0">Prices: Yahoo Finance (Stooq fallback). Financials: SEC EDGAR when reachable, otherwise Yahoo Finance's fundamentals feed (built from the same filings). Ownership: Yahoo Finance. News: Yahoo Finance and Google News. Updated each weekday after the close. ${M.generated ? `Last update ${rel(M.generated)}.` : ""}</p></div>`;
 }
 
 // ------------------------------------------------------------ sheets
@@ -555,6 +630,7 @@ document.addEventListener("click", async e => {
     const l = document.createElement("a"); l.href = u; l.download = `stock-journal-${today()}.json`; l.click(); URL.revokeObjectURL(u);
   }
   else if (a === "doImport") doImport();
+  else if (a === "resetWeights") { cfg.weights = { ...DEFAULT_WEIGHTS }; writeLS(CFG_KEY, cfg); applyWeights(); render(); toast("Weights reset"); }
 });
 document.addEventListener("change", async e => {
   const a = e.target.dataset.act;
@@ -563,6 +639,12 @@ document.addEventListener("change", async e => {
     try { const d = JSON.parse(await e.target.files[0].text()); if (!d.stocks) throw 0; J = d; save(); render(); toast("Backup restored"); } catch { toast("That isn't a journal backup."); }
   }
   else if (a === "toggleLearn") { cfg.learn = e.target.checked; writeLS(CFG_KEY, cfg); }
+  else if (a === "weight") { cfg.weights[e.target.dataset.k] = +e.target.value; writeLS(CFG_KEY, cfg); applyWeights(); toast("Grades updated"); }
+});
+document.addEventListener("input", e => {
+  if (e.target.dataset.act !== "weight") return;
+  const k = e.target.dataset.k, el = document.getElementById("wv-" + k); if (el) el.textContent = e.target.value;
+  const tot = document.getElementById("wtotal"); if (tot) tot.textContent = `Total ${[...document.querySelectorAll("[data-act=weight]")].reduce((a, i) => a + +i.value, 0)} (scores are scaled to 100 either way)`;
 });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) pull(); });
 
@@ -570,7 +652,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) pull
 async function boot() {
   render();
   try { LIST = (await (await fetch(`data/tickers.json?${Date.now()}`, { cache: "no-store" })).json()).tickers; } catch {}
-  try { const r = await fetch(`data/market.json?${Date.now()}`, { cache: "no-store" }); if (r.ok) M = await r.json(); } catch {}
+  try { const r = await fetch(`data/market.json?${Date.now()}`, { cache: "no-store" }); if (r.ok) { M = await r.json(); applyWeights(); } } catch {}
   symbols().forEach(s => { if (J.holdings[s]?.shares && !J.stocks[s]) stock(s).status = "owned"; });
   render(); pull();
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
