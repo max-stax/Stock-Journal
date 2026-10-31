@@ -412,6 +412,8 @@ SEC_INST = {
                ("us-gaap", "ConvertibleNotesPayableNoncurrent"), ("us-gaap", "SeniorNotesNoncurrent"),
                ("us-gaap", "LongTermDebtAndCapitalLeaseObligations"), ("us-gaap", "OtherBorrowings"),
                ("us-gaap", "SecuredDebt"), ("us-gaap", "ConvertibleNotesPayable"), ("us-gaap", "NotesPayable"),
+               ("us-gaap", "ConvertibleDebtNoncurrent"), ("us-gaap", "ConvertibleDebt"),
+               ("us-gaap", "LongTermNotesPayable"), ("us-gaap", "SeniorLongTermNotes"), ("us-gaap", "UnsecuredDebt"),
                ("ifrs-full", "NoncurrentBorrowings"), ("ifrs-full", "Borrowings")],
     "combinedDebt": [("us-gaap", "DebtLongtermAndShorttermCombinedAmount")],
     "faceDebt": [("us-gaap", "DebtInstrumentCarryingAmount")],
@@ -1221,8 +1223,10 @@ def my_rules(price, f):
     R["sales"] = {"name": "Under 2x sales", "pass": None if ps is None else ps < 2, "value": ps,
                   "why": f"Price/sales is {ps}." if ps is not None else "No sales data."}
     nc = b.get("netCash")
-    R["cash"] = {"name": "More cash than debt", "pass": None if nc is None else nc > 0, "value": nc,
-                 "why": (f"Net cash ${nc / 1e9:.2f}B." if abs(nc) >= 1e9 else f"Net cash ${nc / 1e6:.0f}M.").replace("$-", "−$")
+    no_debt = b.get("totalDebt") is None and nc is not None
+    R["cash"] = {"name": "More cash than debt", "pass": None if nc is None else nc > 0, "value": nc, "unverified": no_debt,
+                 "why": ((f"Net cash ${nc / 1e9:.2f}B." if abs(nc) >= 1e9 else f"Net cash ${nc / 1e6:.0f}M.").replace("$-", "−$")
+                         + (" No debt found in its filings: check the balance sheet before trusting this." if no_debt else ""))
                  if nc is not None else "No balance sheet data."}
     g = t.get("revenueGrowth")
     R["revenue"] = {"name": "Revenue growing", "pass": None if g is None else g > 0, "value": g,
