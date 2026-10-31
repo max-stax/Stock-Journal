@@ -16,9 +16,23 @@ fi
 
 echo
 echo "1) Your GitHub token (the fine-grained one with Contents read/write on Stock-Journal)."
-echo "   Typing is hidden. Press Return when done."
-read -r -s -p "   Token: " TOKEN; echo
-[ -n "$TOKEN" ] || { echo "No token entered."; exit 1; }
+echo "   Typing is hidden: paste with Cmd+V, then press Return."
+while true; do
+  read -r -s -p "   Token: " TOKEN; echo
+  TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
+  [ -n "$TOKEN" ] || { echo "   Nothing was entered. Try again."; continue; }
+  echo "   Got a token ending in …${TOKEN: -4} (${#TOKEN} characters). Checking it with GitHub..."
+  PERM="$(curl -s -H "Authorization: Bearer $TOKEN" https://api.github.com/repos/max-stax/Stock-Journal \
+    | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("permissions",{}).get("push", "bad") if "id" in d else "bad")' 2>/dev/null)"
+  if [ "$PERM" = "True" ]; then echo "   Token works and can save to Stock-Journal."; break; fi
+  if [ "$PERM" = "False" ]; then
+    echo "   GitHub accepted the token, but it can't write to Stock-Journal."
+    echo "   Edit the token on GitHub: add the Stock-Journal repo and set Contents to 'Read and write'."
+  else
+    echo "   GitHub rejected that token. It may be mistyped, expired, or deleted. Paste it again"
+    echo "   (or generate a new one: GitHub > Settings > Developer settings > Fine-grained tokens)."
+  fi
+done
 DEFAULT_EMAIL="$(git config --global user.email 2>/dev/null || true)"
 echo
 echo "2) SEC asks every data request to include a contact email. It's stored only on this Mac."

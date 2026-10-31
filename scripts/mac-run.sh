@@ -17,8 +17,13 @@ LOG="$JOB/last-run.log"
     if git diff --cached --quiet; then echo "no changes"; exit 0; fi
     git -c user.name="stock-journal-mac" -c user.email="actions@users.noreply.github.com" \
       commit -q -m "Update market data from Mac $(date +%F)"
-    if git push -q origin main; then echo "pushed"; exit 0; fi
-    echo "push rejected (GitHub job pushed at the same time), retrying"
+    OUT="$(git push -q origin main 2>&1)" && { echo "pushed"; exit 0; }
+    echo "$OUT"
+    case "$OUT" in
+      *uthentication*|*"Invalid username or token"*|*403*)
+        echo "PUSH FAILED: GitHub rejected the token. Rerun the setup command with a valid token."; exit 1;;
+    esac
+    echo "push rejected (the GitHub job saved at the same moment), retrying"
     sleep 20
   done
 } >> "$LOG" 2>&1
