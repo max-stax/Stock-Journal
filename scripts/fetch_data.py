@@ -436,7 +436,7 @@ def _unit_rows(facts, tax, concept, unit_pref):
     return None, None
 
 
-def _dur(facts, cands, unit_pref):
+def _dur(facts, cands, unit_pref, take_max=False):
     out, unit_used = {}, None
     for tax, concept in cands:
         rows, unit = _unit_rows(facts, tax, concept, unit_pref)
@@ -447,7 +447,8 @@ def _dur(facts, cands, unit_pref):
                 continue
             key = (r["start"], r["end"])
             p = out.get(key)
-            if p is None or (p["_c"] == concept and r.get("filed", "") > p.get("filed", "")):
+            if p is None or (p["_c"] == concept and r.get("filed", "") > p.get("filed", "")) \
+                    or (take_max and p["_c"] != concept and r["val"] > p["val"]):
                 out[key] = {**r, "_c": concept}
         unit_used = unit_used or unit
     return list(out.values()), unit_used
@@ -508,7 +509,8 @@ def _quarters(rows):
 
 
 def from_sec(facts):
-    rev_rows, currency = _dur(facts, SEC_DUR["revenue"], ("USD",))
+    rev_rows, currency = _dur(facts, SEC_DUR["revenue"] + [("us-gaap", "InterestAndDividendIncomeOperating")],
+                              ("USD",), take_max=True)
     currency = currency or "USD"
     up = (currency,)
     rows = {k: (rev_rows if k == "revenue" else
@@ -560,7 +562,8 @@ def from_sec(facts):
     qr = {k: _quarters(rows[k]) for k in ("revenue", "eps", "netIncome")}
     qends = sorted(set(qr["revenue"]) | set(qr["eps"]))[-9:]
     quarters = [{"end": e, **{k: qr[k].get(e) for k in qr}} for e in qends]
-    return {"source": "SEC EDGAR", "currency": currency, "fy": fy, "ttm": ttm, "growth": growth, "bal": bal,
+    financial = any(c in facts.get("us-gaap", {}) for c in ("Deposits", "InterestBearingDepositLiabilities"))
+    return {"source": "SEC EDGAR", "financial": financial, "currency": currency, "fy": fy, "ttm": ttm, "growth": growth, "bal": bal,
             "quarters": quarters, "shares": so[max(so)] if so else None}
 
 
@@ -779,7 +782,10 @@ def _fh_items(report):
     return out
 
 
-def _pick(items, cands):
+def _pick(items, cands, take_max=False):
+    if take_max:
+        vals = [items[c] for _, c in cands if c in items]
+        return max(vals) if vals else None
     for _, concept in cands:
         if concept in items:
             return items[concept]
@@ -801,7 +807,8 @@ def _fh_balance(bs):
 
 def _fh_flow(ic, cf):
     g = lambda d, k: _pick(d, SEC_DUR[k])  # noqa: E731
-    rev, gp, cor = g(ic, "revenue"), g(ic, "grossProfit"), g(ic, "costOfRevenue")
+    rev = _pick(ic, SEC_DUR["revenue"] + [("us-gaap", "InterestAndDividendIncomeOperating")], take_max=True)
+    gp, cor = g(ic, "grossProfit"), g(ic, "costOfRevenue")
     if gp is None and rev is not None and cor is not None:
         gp = rev - cor
     capex = g(cf, "capex")
@@ -869,7 +876,9 @@ def from_finnhub(sym):
                 growth = pct(quarters[-1]["revenue"], ya["revenue"])
     except Exception as e:  # noqa: BLE001
         print(f"{sym}: Finnhub quarterly unavailable ({e}); annual only", file=sys.stderr)
-    return {"source": "Finnhub (as reported to the SEC)", "currency": "USD", "fy": fy, "ttm": ttm, "growth": growth,
+    last_bs = _fh_items(((sorted(ann, key=lambda a: a["endDate"])[-1]).get("report") or {}).get("bs"))
+    financial = any(c in last_bs for c in ("Deposits", "InterestBearingDepositLiabilities"))
+    return {"source": "Finnhub (as reported to the SEC)", "financial": financial, "currency": "USD", "fy": fy, "ttm": ttm, "growth": growth,
             "bal": bal, "quarters": quarters, "shares": fy[-1].get("dilutedShares")}
 
 
@@ -896,7 +905,7 @@ def derive_balance(b, revenue=None):
     return b
 
 
-def balance_part(b, fcf, bvps_growth):
+def balance_part(b, fcf, bvps_growth, ocf=None):
     """Balance-sheet part of the grade, built from assets, liabilities and equity."""
     checks = []
 
@@ -934,8 +943,8 @@ def balance_part(b, fcf, bvps_growth):
     tw = sum(c["weight"] for c in checks)
     r = sum(c["score"] * c["weight"] for c in checks) / tw
     note = ""
-    if fcf is not None and fcf < 0 and nc is not None:
-        runway = max(nc, 0) / -fcf
+    if ocf is not None and ocf < 0 and nc is not None:  # operations themselves lose cash
+        runway = max(nc, 0) / -ocf
         r *= min(1.0, runway / 3)
         note = (f" Burning cash: about {runway:.1f} years of runway." if runway < 10 else
                 " Burning cash, but cash covers 10+ years.")
@@ -960,12 +969,13 @@ def grade(r, b, bvps_growth, weights=WEIGHTS):
         add("profit", "Profitability", om, _interp(om, [(-25, 0), (-10, .15), (0, .35), (5, .55), (15, .8), (25, 1)]),
             f"Keeps {om:.0f}¢ of operating profit per $1 of sales." if om >= 0
             else f"Loses {abs(om):.0f}¢ on operations per $1 of sales.")
-    fm = r.get("fcfMargin")
+    fm = None if r.get("_financial") else r.get("fcfMargin")
     if fm is not None:
         add("cash", "Cash generation", fm, _interp(fm, [(-20, 0), (-10, .15), (0, .4), (10, .75), (20, 1)]),
             f"Turns {fm:.0f}¢ of every sales dollar into free cash." if fm >= 0
             else f"Burns {abs(fm):.0f}¢ of cash per $1 of sales.")
-    bp = balance_part({**b, "_revenue": r.get("revenue")}, r.get("fcf"), bvps_growth) if b else None
+    bp = balance_part({**b, "_revenue": r.get("revenue")}, r.get("fcf"), bvps_growth,
+                      None if r.get("_financial") else r.get("operatingCashFlow")) if b else None
     if bp:
         add("balance", "Balance sheet", None, bp["ratio"], bp["why"], bp["checks"])
     sc = r.get("shareChange")
@@ -1044,6 +1054,8 @@ def adjust_splits(raw):
 def analyze(raw, price):
     split_note = adjust_splits(raw)
     fy = raw["fy"]
+    for row in fy:
+        row["_financial"] = bool(raw.get("financial"))
     prev = None
     for row in fy:
         row["fcf"] = row["operatingCashFlow"] - abs(row["capex"]) \
@@ -1090,9 +1102,9 @@ def analyze(raw, price):
             bvps_g = round(((1 + bvps_g / 100) / (1 + fy[-1]["shareChange"] / 100) - 1) * 100, 1)
     latest["bvpsGrowth"] = bvps_g
 
-    snap = {**t, "shareChange": fy[-1].get("shareChange")}
+    snap = {**t, "shareChange": fy[-1].get("shareChange"), "_financial": bool(raw.get("financial"))}
     out = {"source": raw["source"], "currency": raw["currency"], "fy": fy, "ttm": t, "balance": latest,
-           "splitNote": split_note,
+           "splitNote": split_note, "financial": bool(raw.get("financial")),
            "quarters": raw["quarters"], "valuation": {"sharesOutstanding": shares}}
     out["grade"] = grade(snap, latest, bvps_g)
     out["grade"]["asOf"] = t.get("asOf")
