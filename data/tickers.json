@@ -1,0 +1,20 @@
+{
+  "_note": "Tickers the daily job fetches. 'callout' is the source pick for reference. Add a ticker here (or from the app) and the next run picks it up.",
+  "tickers": [
+    {"symbol": "AMD",  "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$435 / $270", "theirAvg": 123.23}},
+    {"symbol": "HIMS", "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$24 / $19", "theirAvg": 27.25}},
+    {"symbol": "AAOI", "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$94 / $80", "theirAvg": 103.13}},
+    {"symbol": "SOFI", "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$15 / $10.50", "theirAvg": 15.36}},
+    {"symbol": "NBIS", "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$170 / $135", "theirAvg": 105.34}},
+    {"symbol": "VST",  "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$148 / $135", "theirAvg": 137.38}},
+    {"symbol": "AMZN", "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$240 / $200", "theirAvg": 189.60}},
+    {"symbol": "META", "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$600 / $540", "theirAvg": 566.08}},
+    {"symbol": "OSCR", "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$23.50 / $18.50", "theirAvg": 16.90}},
+    {"symbol": "RDDT", "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$140 / $125", "theirAvg": 145.94}},
+    {"symbol": "NOW",  "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$115 / $80", "theirAvg": 131.23}},
+    {"symbol": "ZETA", "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$25 / $16", "theirAvg": 21.08}},
+    {"symbol": "LMND", "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$47 / $30", "theirAvg": 32.25}},
+    {"symbol": "RKLB", "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$62 / $56", "theirAvg": 71.42}},
+    {"symbol": "DRAM", "callout": {"source": "Kevonz LT portfolio, 8 Oct 2026", "entries": "$54 / $46", "theirAvg": 52.52}}
+  ]
+}
