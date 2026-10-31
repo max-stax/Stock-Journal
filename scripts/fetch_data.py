@@ -373,6 +373,7 @@ BAL_KEYS = ("cash", "sti", "totalDebt", "equity", "currentAssets", "currentLiabi
 
 ANNUAL_FORMS = {"10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A", "10-KT"}
 QUARTER_FORMS = {"10-Q", "10-Q/A", "6-K"}
+REPORT_FORMS = ANNUAL_FORMS | QUARTER_FORMS  # proxies (DEF 14A), 8-Ks, S-1s etc. repeat numbers; ignore them
 
 SEC_DUR = {
     "revenue": [("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax"), ("us-gaap", "Revenues"),
@@ -451,7 +452,7 @@ def _dur(facts, cands, unit_pref, take_max=False):
         if not rows:
             continue
         for r in rows:
-            if "start" not in r:
+            if "start" not in r or r.get("form") not in REPORT_FORMS:
                 continue
             key = (r["start"], r["end"])
             p = out.get(key)
@@ -467,7 +468,7 @@ def _inst(facts, cands, unit_pref):
     for tax, concept in cands:
         rows, _ = _unit_rows(facts, tax, concept, unit_pref)
         for r in rows or []:
-            if "start" in r:
+            if "start" in r or r.get("form") not in REPORT_FORMS:
                 continue
             p = out.get(r["end"])
             if p is None or (p["_c"] == concept and r.get("filed", "") > p.get("filed", "")):
