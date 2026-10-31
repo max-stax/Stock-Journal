@@ -1202,7 +1202,17 @@ def my_rules(price, f):
         if ya:
             eg_q = (q[-1]["eps"], ya["eps"])
     eg_a = fy[-1].get("epsGrowth") if fy else None
-    if eg_q:
+    if eg_q and 0 in eg_q and len(q) >= 5:
+        ya = next((x for x in reversed(q[:-1]) if 355 <= _days(x["end"], q[-1]["end"]) <= 375), None)
+        n1, n0 = q[-1].get("netIncome"), (ya or {}).get("netIncome")
+        if n1 is not None and n0 is not None:
+            eg_q = None
+            ok = n1 > n0
+            why = f"Latest quarter net income ${n1 / 1e6:,.0f}M vs ${n0 / 1e6:,.0f}M a year ago (EPS not reported).".replace("$-", "−$")
+            R["earnings"] = {"name": "Earnings growing", "pass": ok, "value": eg_a, "why": why}
+    if "earnings" in R:
+        pass
+    elif eg_q:
         cur, prev = eg_q
         ok = cur > prev
         dp = 3 if max(abs(cur), abs(prev)) < 0.1 else 2
@@ -1212,7 +1222,8 @@ def my_rules(price, f):
         why = f"Yearly EPS {fy[-1]['eps']:.2f} vs {fy[-2]['eps']:.2f} the year before."
     else:
         ok, why = None, "No earnings data."
-    R["earnings"] = {"name": "Earnings growing", "pass": ok, "value": eg_a, "why": why}
+    if "earnings" not in R:
+        R["earnings"] = {"name": "Earnings growing", "pass": ok, "value": eg_a, "why": why}
     label, ok, why = chart_pattern(price)
     R["chart"] = {"name": "Chart: sideways or slightly up", "pass": ok, "value": label,
                   "why": (label + ". " if label else "") + why}
@@ -1225,7 +1236,7 @@ def canslim(price, f, inst, market, spy):
     def put(k, name, ok, value, why):
         L[k] = {"name": name, "pass": ok, "value": value, "why": why}
 
-    q = [x for x in (f or {}).get("quarters", []) if x.get("eps") is not None]
+    q = [x for x in (f or {}).get("quarters", []) if x.get("eps") not in (None, 0)]
     if len(q) >= 5:
         cur, ya = q[-1], next((x for x in reversed(q[:-1]) if 355 <= _days(x["end"], q[-1]["end"]) <= 375), None)
         if ya:
