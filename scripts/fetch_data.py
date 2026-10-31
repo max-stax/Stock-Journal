@@ -52,7 +52,8 @@ def _decode(body, enc):
 
 
 socket.setdefaulttimeout(15)
-TIMINGS = {}  # "SYM source" -> seconds, written to market.json so slow sources are visible
+TIMINGS = {}
+_OLD_META_SPY = None  # "SYM source" -> seconds, written to market.json so slow sources are visible
 
 
 SLOW = set()  # sources that hit their time limit; skipped for the rest of the run
@@ -251,11 +252,19 @@ def build_price(hist, last=None, currency="USD"):
     for d, c, _ in hist:
         monthly[d[:7]] = (d, c)
 
-    def ret(n):
-        return round((last / closes[-n - 1] - 1) * 100, 1) if len(closes) > n else None
+    end_d = date.fromisoformat(hist[-1][0])
+
+    def ret(n):  # n trading days back, located by calendar date (works on daily or sparse history)
+        cutoff = (end_d - timedelta(days=round(n * 365 / 252))).isoformat()
+        before = [c for d, c, _ in hist if d <= cutoff]
+        return round((last / before[-1] - 1) * 100, 1) if before and hist[0][0] <= cutoff else None
 
     def ma(n):
-        return round(sum(closes[-n:]) / n, 4) if len(closes) >= n else None
+        cutoff = (end_d - timedelta(days=round(n * 365 / 252))).isoformat()
+        win = [c for d, c, _ in hist if d > cutoff]
+        if not win or hist[0][0] > (date.fromisoformat(cutoff) + timedelta(days=10)).isoformat() or len(win) < 5:
+            return None
+        return round(sum(win) / len(win), 4)
 
     up = dn = 0.0
     for (_, c0, _), (_, c1, v1) in zip(hist[-51:-1], hist[-50:]):
@@ -272,6 +281,7 @@ def build_price(hist, last=None, currency="USD"):
         "upDownVol50": round(up / dn, 2) if dn else None,
         "history": [[d, c] for d, c in weekly],
         "monthly": [[d, c] for d, c in monthly.values()],
+        "daily": [[d, c, v] for d, c, v in hist[-300:]],
     }
 
 
@@ -285,13 +295,51 @@ def price_fmp(sym):
     return build_price(hist, None, "USD")
 
 
-def fetch_price(sym):
+def price_finnhub(sym):
+    now = int(time.time())
+    d = finnhub("stock/candle", symbol=sym, resolution="D", **{"from": now - 5 * 365 * 86400, "to": now})
+    if d.get("s") != "ok":
+        raise RuntimeError(f"Finnhub candles: {d.get('s') or d}")
+    hist = [(datetime.fromtimestamp(t, timezone.utc).date().isoformat(), float(c), float(v or 0))
+            for t, c, v in zip(d["t"], d["c"], d.get("v") or [0] * len(d["t"]))]
+    return build_price(hist, None, "USD")
+
+
+def price_from_quote(sym, prev):
+    """Last resort: today's quote from Finnhub, added to the history already stored."""
+    q = finnhub("quote", symbol=sym)
+    if not q.get("c"):
+        raise RuntimeError("Finnhub quote empty")
+    day = datetime.fromtimestamp(q.get("t") or time.time(), timezone.utc).date().isoformat()
+    prev = prev or {}
+    old = {d: (c, v) for d, c, v in prev.get("daily", [])}
+    if not old:  # coarser history from earlier runs (monthly, then weekly for the last year)
+        for d, c in prev.get("monthly", []) + prev.get("history", []):
+            old[d] = (c, 0)
+    old[day] = (float(q["c"]), 0)
+    hist = sorted((d, c, v) for d, (c, v) in old.items())
+    p = build_price(hist, float(q["c"]), "USD")
+    if q.get("pc"):
+        p["prevClose"], p["change"] = q["pc"], round(q["c"] - q["pc"], 4)
+        p["changePct"] = round(q["dp"], 2) if q.get("dp") is not None else round((q["c"] / q["pc"] - 1) * 100, 2)
+    if not prev.get("daily"):
+        p["approxHistory"] = True  # moving averages estimated from weekly/monthly points until daily data builds up
+    return p
+
+
+def fetch_price(sym, prev=None):
     errors = []
-    for fn in ((price_fmp,) if FMP_KEY else ()) + (price_yahoo, price_stooq):
+    chain = ((price_fmp,) if FMP_KEY else ()) + ((price_finnhub,) if FINNHUB_KEY else ()) + (price_yahoo, price_stooq)
+    for fn in chain:
         try:
             return fn(sym), None
         except Exception as e:  # noqa: BLE001
-            errors.append(f"{fn.__name__}: {e}")
+            errors.append(f"{fn.__name__}: {str(e)[:120]}")
+    if FINNHUB_KEY:
+        try:
+            return price_from_quote(sym, prev), None
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"finnhub quote: {e}")
     return None, "; ".join(errors)
 
 
@@ -1284,9 +1332,12 @@ def fetch_news(sym, company):
 def main():
     with open(TICKERS_FILE) as fh:
         tickers = [t["symbol"].upper() for t in json.load(fh)["tickers"]]
+    global _OLD_META_SPY
     try:
         with open(OUT_FILE) as fh:
-            old = json.load(fh).get("tickers", {})
+            prev_all = json.load(fh)
+        old = prev_all.get("tickers", {})
+        _OLD_META_SPY = (prev_all.get("meta") or {}).get("spyPrice")
     except Exception:  # noqa: BLE001
         old = {}
 
@@ -1298,11 +1349,11 @@ def main():
     if sec_err:
         print("SEC unavailable, using Yahoo fundamentals:", sec_err, file=sys.stderr)
     try:
-        spy, _ = timed("SPY price", fetch_price, "SPY", limit=30)
+        spy, _ = timed("SPY price", fetch_price, "SPY", _OLD_META_SPY, limit=45)
     except Exception:  # noqa: BLE001
         spy = None
     market = market_direction(spy)
-    meta = {"sec": "ok" if sec_ok else sec_err, "market": market,
+    meta = {"sec": "ok" if sec_ok else sec_err, "market": market, "spyPrice": spy,
             "spy": {k: spy.get(k) for k in ("last", "ret3m", "ret6m", "ret9m", "ret12m")} if spy else None,
             "weights": WEIGHTS}
 
@@ -1312,7 +1363,7 @@ def main():
         rec = {"symbol": sym, "errors": {}}
         cik, name = tmap.get(sym) or (prev.get("cik"), prev.get("name"))
         try:
-            price, err = timed(f"{sym} price", fetch_price, sym, limit=30)
+            price, err = timed(f"{sym} price", fetch_price, sym, prev.get("price"), limit=45)
         except Exception as e:  # noqa: BLE001
             price, err = None, str(e)
         qtype = prev.get("quoteType")
