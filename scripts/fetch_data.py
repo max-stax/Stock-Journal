@@ -344,6 +344,21 @@ def fetch_price(sym, prev=None):
     return None, "; ".join(errors)
 
 
+def merge_history(new, prev):
+    """Never lose history: keep older stored points that the new source doesn't cover."""
+    if not new or not prev:
+        return new
+    for key in ("monthly", "daily"):
+        nv, pv = new.get(key) or [], prev.get(key) or []
+        if nv and pv:
+            first = nv[0][0][:7] if key == "monthly" else nv[0][0]
+            older = [x for x in pv if (x[0][:7] if key == "monthly" else x[0]) < first]
+            new[key] = older + nv
+            if key == "daily":
+                new[key] = new[key][-300:]
+    return new
+
+
 def rs_weighted(p):
     """IBD-style weighting: latest quarter counts double."""
     if not p or p.get("ret12m") is None:
@@ -1479,6 +1494,8 @@ def main():
             except Exception as e:  # noqa: BLE001
                 print(f"{sym} FMP profile failed: {e}", file=sys.stderr)
         rec.update({"cik": cik, "name": name, "quoteType": qtype})
+        if price:
+            price = merge_history(price, prev.get("price"))
         rec["price"] = price or prev.get("price")
         if err and not price:
             rec["errors"]["price"] = err
