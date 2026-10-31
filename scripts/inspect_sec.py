@@ -20,7 +20,7 @@ def get(url):
 
 
 tick = {v["ticker"]: str(v["cik_str"]).zfill(10) for v in get("https://www.sec.gov/files/company_tickers.json").values()}
-for sym in [a.upper() for a in sys.argv[1:]]:
+for sym in [a.upper() for a in sys.argv[1:] if not a.startswith("--")]:
     facts = get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{tick[sym]}.json")["facts"]
     print(f"\n===== {sym}  taxonomies: {', '.join(facts)}")
     for label, pat in PATTERNS.items():
@@ -37,3 +37,21 @@ for sym in [a.upper() for a in sys.argv[1:]]:
                     if last["end"] < "2024-06-01":
                         continue
                     print(f"   {tax}:{name}  [{unit}]  {last['end']}  {last['val']:,}")
+
+
+# --parse: run the app's own parser and show what it extracts
+if "--parse" in sys.argv:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import fetch_data as fd
+    for sym in [a.upper() for a in sys.argv[1:] if not a.startswith("--")]:
+        facts = get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{tick[sym]}.json")["facts"]
+        node = facts.get("us-gaap", {}).get("NetIncomeLoss", {}).get("units", {}).get("USD", [])
+        fy = [r for r in node if r.get("end", "").startswith("2025-12") or r.get("end", "").startswith("2025-09")]
+        print(f"\n##### {sym} raw NetIncomeLoss rows near FY2025:")
+        for r in fy[-8:]:
+            print("   ", {k: r.get(k) for k in ("start", "end", "val", "form", "fp", "fy", "filed", "frame")})
+        raw = fd.from_sec(facts)
+        print(f"##### {sym} parsed fiscal years:")
+        for row in raw["fy"]:
+            print(f"   {row['end']}  revenue={row.get('revenue')}  netIncome={row.get('netIncome')}  debt={row.get('totalDebt')}")
+        print("   ttm:", {k: raw["ttm"].get(k) for k in ("asOf", "revenue", "netIncome")})

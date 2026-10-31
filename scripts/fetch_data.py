@@ -409,10 +409,11 @@ SEC_INST = {
             ("us-gaap", "AvailableForSaleSecuritiesDebtSecuritiesCurrent"), ("ifrs-full", "CurrentInvestments")],
     "ltDebt": [("us-gaap", "LongTermDebtNoncurrent"), ("us-gaap", "LongTermDebt"),
                ("us-gaap", "ConvertibleNotesPayableNoncurrent"), ("us-gaap", "SeniorNotesNoncurrent"),
-               ("us-gaap", "LongTermDebtAndCapitalLeaseObligations"), ("us-gaap", "DebtInstrumentCarryingAmount"),
-               ("us-gaap", "DebtLongtermAndShorttermCombinedAmount"), ("us-gaap", "OtherBorrowings"),
+               ("us-gaap", "LongTermDebtAndCapitalLeaseObligations"), ("us-gaap", "OtherBorrowings"),
                ("us-gaap", "SecuredDebt"), ("us-gaap", "ConvertibleNotesPayable"), ("us-gaap", "NotesPayable"),
                ("ifrs-full", "NoncurrentBorrowings"), ("ifrs-full", "Borrowings")],
+    "combinedDebt": [("us-gaap", "DebtLongtermAndShorttermCombinedAmount")],
+    "faceDebt": [("us-gaap", "DebtInstrumentCarryingAmount")],
     "stDebt": [("us-gaap", "LongTermDebtCurrent"), ("us-gaap", "DebtCurrent"),
                ("us-gaap", "ConvertibleNotesPayableCurrent"), ("ifrs-full", "CurrentBorrowings")],
     "equity": [("us-gaap", "StockholdersEquity"),
@@ -535,7 +536,12 @@ def from_sec(facts):
         for k in inst:
             near = [x for x in inst[k] if abs(_days(x, d)) <= tol]
             b[k] = inst[k][min(near, key=lambda x: abs(_days(x, d)))] if near else None
-        debt = None if b["ltDebt"] is None and b["stDebt"] is None else (b["ltDebt"] or 0) + (b["stDebt"] or 0)
+        if b["ltDebt"] is not None or b["stDebt"] is not None:
+            debt = (b["ltDebt"] or 0) + (b["stDebt"] or 0)
+        elif b["combinedDebt"] is not None:
+            debt = b["combinedDebt"]          # already includes the current portion
+        else:
+            debt = b["faceDebt"]              # face value of debt instruments (last resort)
         intang = None if b["goodwill"] is None and b["otherIntangibles"] is None else \
             (b["goodwill"] or 0) + (b["otherIntangibles"] or 0)
         tl = b["totalLiabilities"]
