@@ -12,7 +12,7 @@ A home-screen app for researching and tracking stock picks:
 
 ## How it works
 
-- `scripts/fetch_data.py` runs on GitHub Actions each weekday after the close (`.github/workflows/update-data.yml`). It pulls prices (Yahoo Finance, Stooq fallback), financials (SEC EDGAR when reachable; SEC often blocks GitHub's shared servers, so Yahoo Finance's fundamentals feed is the fallback), and news (Yahoo Finance + Google News RSS) for every ticker in `data/tickers.json`, and commits `data/market.json`.
+- `scripts/fetch_data.py` runs on GitHub Actions each weekday after the close (`.github/workflows/update-data.yml`). It pulls prices (Yahoo Finance, Stooq fallback), financials (SEC EDGAR when reachable, then Financial Modeling Prep if `FMP_API_KEY` is set as a repo secret, then Yahoo Finance), and news (Yahoo Finance + Google News RSS) for every ticker in `data/tickers.json`, and commits `data/market.json`.
 - The app (`index.html`, `app.js`, `learn.js`) is static and served by GitHub Pages.
 - Your journal and positions are saved on your phone. With a token, they sync to the private `Stock-Journal-data` repo as `journal.json`, so your notes never touch this public repo.
 

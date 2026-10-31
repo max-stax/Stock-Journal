@@ -14,12 +14,12 @@ permissions:
 
 concurrency:
   group: update-data
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,6 +28,7 @@ jobs:
       - name: Fetch prices, filings, news
         env:
           SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
         run: python scripts/fetch_data.py
       - name: Commit market.json
         run: |

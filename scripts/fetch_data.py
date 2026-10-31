@@ -49,7 +49,13 @@ def _decode(body, enc):
     return body
 
 
-def get(url, ua=BROWSER_UA, timeout=25, tries=3, opener=None):
+HOST_FAILS = {}  # host -> consecutive timeouts; after 2, skip the host for the rest of the run
+
+
+def get(url, ua=BROWSER_UA, timeout=12, tries=2, opener=None):
+    host = urllib.parse.urlsplit(url).netloc
+    if HOST_FAILS.get(host, 0) >= 2:
+        raise RuntimeError(f"{host} skipped (not responding this run)")
     last = None
     op = opener or urllib.request.build_opener()
     for i in range(tries):
@@ -57,6 +63,7 @@ def get(url, ua=BROWSER_UA, timeout=25, tries=3, opener=None):
             req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept-Encoding": "gzip, deflate",
                                                        "Accept": "*/*"})
             with op.open(req, timeout=timeout) as r:
+                HOST_FAILS[host] = 0
                 return _decode(r.read(), r.headers.get("Content-Encoding"))
         except urllib.error.HTTPError as e:
             snippet = ""
@@ -71,7 +78,11 @@ def get(url, ua=BROWSER_UA, timeout=25, tries=3, opener=None):
                 break
         except Exception as e:  # noqa: BLE001
             last = RuntimeError(f"{type(e).__name__}: {e}")
-        time.sleep(2 * (i + 1))
+            if "timed out" in str(e).lower() or isinstance(e, TimeoutError):
+                HOST_FAILS[host] = HOST_FAILS.get(host, 0) + 1
+                if HOST_FAILS[host] >= 2:
+                    break
+        time.sleep(1.5 * (i + 1))
     raise last
 
 
@@ -115,11 +126,12 @@ class Yahoo:
     def _crumb(self):
         if self.crumb is None:
             try:
-                get("https://fc.yahoo.com", opener=self.op, tries=1)
+                get("https://fc.yahoo.com", opener=self.op, tries=1, timeout=6)
             except Exception:  # noqa: BLE001  (404 is normal; it still sets the cookie)
                 pass
             try:
-                self.crumb = get("https://query2.finance.yahoo.com/v1/test/getcrumb", opener=self.op).decode().strip()
+                self.crumb = get("https://query2.finance.yahoo.com/v1/test/getcrumb", opener=self.op,
+                                 tries=1, timeout=8).decode().strip()
             except Exception:  # noqa: BLE001
                 self.crumb = ""
         return self.crumb
@@ -149,7 +161,11 @@ def price_yahoo(sym):
     hist = [(datetime.fromtimestamp(t, timezone.utc).date().isoformat(), round(c, 4), v or 0)
             for t, c, v in zip(res.get("timestamp") or [], q.get("close") or [], q.get("volume") or [])
             if c is not None]
-    return build_price(hist, res["meta"].get("regularMarketPrice"), res["meta"].get("currency", "USD"))
+    p = build_price(hist, res["meta"].get("regularMarketPrice"), res["meta"].get("currency", "USD"))
+    m = res["meta"]
+    p["_name"] = m.get("longName") or m.get("shortName")
+    p["_type"] = m.get("instrumentType")
+    return p
 
 
 def price_stooq(sym):
@@ -562,6 +578,88 @@ def from_yahoo(sym):
             "growth": growth, "bal": bal, "quarters": quarters, "shares": shares}
 
 
+# ---------------------------------------------------------------- Financial Modeling Prep (free key)
+
+FMP_KEY = os.environ.get("FMP_API_KEY", "").strip()
+
+
+def fmp(path, **params):
+    params["apikey"] = FMP_KEY
+    data = get_json(f"https://financialmodelingprep.com/stable/{path}?" + urllib.parse.urlencode(params))
+    if isinstance(data, dict) and (data.get("Error Message") or data.get("error")):
+        raise RuntimeError(f"FMP {path}: {data.get('Error Message') or data.get('error')}")
+    return data if isinstance(data, list) else []
+
+
+def _f(r, *keys):
+    for k in keys:
+        if r.get(k) is not None:
+            return r[k]
+    return None
+
+
+def from_fmp(sym):
+    inc = {r["date"]: r for r in fmp("income-statement", symbol=sym, period="annual", limit=5)}
+    if not inc:
+        return None
+    bs = {r["date"]: r for r in fmp("balance-sheet-statement", symbol=sym, period="annual", limit=5)}
+    cf = {r["date"]: r for r in fmp("cash-flow-statement", symbol=sym, period="annual", limit=5)}
+    currency = next(iter(inc.values())).get("reportedCurrency") or "USD"
+
+    def bal(b):
+        if not b:
+            return {k: None for k in BAL_KEYS}
+        return {"cash": _f(b, "cashAndCashEquivalents"), "sti": _f(b, "shortTermInvestments"),
+                "totalDebt": _f(b, "totalDebt"), "equity": _f(b, "totalStockholdersEquity", "totalEquity"),
+                "currentAssets": _f(b, "totalCurrentAssets"), "currentLiabilities": _f(b, "totalCurrentLiabilities"),
+                "totalAssets": _f(b, "totalAssets"), "totalLiabilities": _f(b, "totalLiabilities"),
+                "intangibles": _f(b, "goodwillAndIntangibleAssets")}
+
+    def flow(i, c):
+        c = c or {}
+        capex = _f(c, "capitalExpenditure", "investmentsInPropertyPlantAndEquipment")
+        return {"revenue": _f(i, "revenue"), "grossProfit": _f(i, "grossProfit"),
+                "operatingIncome": _f(i, "operatingIncome"), "netIncome": _f(i, "netIncome"),
+                "operatingCashFlow": _f(c, "operatingCashFlow", "netCashProvidedByOperatingActivities"),
+                "capex": abs(capex) if capex is not None else None, "sbc": _f(c, "stockBasedCompensation"),
+                "eps": _f(i, "epsDiluted", "epsdiluted", "eps"),
+                "dilutedShares": _f(i, "weightedAverageShsOutDil", "weightedAverageShsOut")}
+
+    ends = sorted(inc)[-5:]
+    fy = [{"end": e, **flow(inc[e], cf.get(e)), **bal(bs.get(e))} for e in ends]
+    ttm, quarters, growth, bal_map = dict(fy[-1]), [], None, {e: bal(bs[e]) for e in bs}
+    ttm["asOf"] = ends[-1]
+    try:  # quarterly data may not be on every free plan; annual still works without it
+        qi = {r["date"]: r for r in fmp("income-statement", symbol=sym, period="quarter", limit=8)}
+        qc = {r["date"]: r for r in fmp("cash-flow-statement", symbol=sym, period="quarter", limit=4)}
+        qb = fmp("balance-sheet-statement", symbol=sym, period="quarter", limit=5)
+        qs = sorted(qi)
+        quarters = [{"end": d, "revenue": _f(qi[d], "revenue"), "eps": _f(qi[d], "epsDiluted", "epsdiluted", "eps"),
+                     "netIncome": _f(qi[d], "netIncome")} for d in qs]
+        last4 = qs[-4:]
+        if len(last4) == 4:
+            for k in ("revenue", "grossProfit", "operatingIncome", "netIncome", "eps"):
+                vals = [flow(qi[d], None)[k] for d in last4]
+                ttm[k] = sum(vals) if None not in vals else ttm[k]
+            cvals = [flow(qi[d], qc.get(d)) for d in last4]
+            for k in ("operatingCashFlow", "capex", "sbc"):
+                vals = [x[k] for x in cvals]
+                if None not in vals:
+                    ttm[k] = sum(vals)
+            ttm["asOf"] = last4[-1]
+        if len(quarters) >= 5 and quarters[-5]["revenue"]:
+            growth = pct(quarters[-1]["revenue"], quarters[-5]["revenue"])
+        for r in qb:
+            bal_map[r["date"]] = bal(r)
+    except Exception as e:  # noqa: BLE001
+        print(f"{sym}: FMP quarterly data unavailable ({e}); using annual only", file=sys.stderr)
+    shares = fy[-1].get("dilutedShares")
+    return {"source": "Financial Modeling Prep (from company filings)", "currency": currency, "fy": fy,
+            "ttm": {k: ttm.get(k) for k in ("asOf", "revenue", "grossProfit", "operatingIncome", "netIncome",
+                                            "operatingCashFlow", "capex", "sbc", "eps")},
+            "growth": growth, "bal": bal_map, "quarters": quarters, "shares": shares}
+
+
 # ================================================================ analysis
 
 def derive_balance(b, revenue=None):
@@ -963,15 +1061,6 @@ def fetch_news(sym, company):
     return out[:20], ("; ".join(errs) if errs and not out else None)
 
 
-def yahoo_name(sym):
-    try:
-        r = YH.json(f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{sym}?modules=price")
-        p = r["quoteSummary"]["result"][0]["price"]
-        return p.get("longName") or p.get("shortName"), p.get("quoteType")
-    except Exception:  # noqa: BLE001
-        return None, None
-
-
 # ================================================================ main
 
 def main():
@@ -998,13 +1087,13 @@ def main():
         prev = old.get(sym, {})
         rec = {"symbol": sym, "errors": {}}
         cik, name = tmap.get(sym) or (prev.get("cik"), prev.get("name"))
-        qtype = prev.get("quoteType")
-        if not name or not qtype:
-            n, qtype = yahoo_name(sym)
-            name = name or n
-        rec.update({"cik": cik, "name": name, "quoteType": qtype})
-
         price, err = fetch_price(sym)
+        qtype = prev.get("quoteType")
+        if price:
+            name = name or price.pop("_name", None)
+            qtype = price.pop("_type", None) or qtype
+            price.pop("_name", None)
+        rec.update({"cik": cik, "name": name, "quoteType": qtype})
         rec["price"] = price or prev.get("price")
         if err and not price:
             rec["errors"]["price"] = err
@@ -1019,6 +1108,13 @@ def main():
                 except Exception as e:  # noqa: BLE001
                     ferr.append(f"SEC: {e}")
                 time.sleep(0.25)
+            if raw is None and FMP_KEY:
+                try:
+                    raw = from_fmp(sym)
+                    if raw is None:
+                        ferr.append("FMP: no statements for this symbol")
+                except Exception as e:  # noqa: BLE001
+                    ferr.append(f"FMP: {e}")
             if raw is None:
                 try:
                     raw = from_yahoo(sym)
