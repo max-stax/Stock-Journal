@@ -1443,7 +1443,14 @@ def fetch_news(sym, company):
 
 # ================================================================ main
 
-def main():
+def main(argv=None):
+    """Modes:
+      (default)        refresh every ticker
+      --new-only       only tickers with no data yet (used right after you add a stock)
+      --only A,B       only these tickers
+      --need-sec       only tickers whose financials aren't from SEC yet (used by the Mac every 5 minutes)
+    Env SKIP_PRICES=1 keeps stored prices for existing tickers (the Mac can't reach price sources)."""
+    argv = sys.argv[1:] if argv is None else argv
     with open(TICKERS_FILE) as fh:
         tickers = [t["symbol"].upper() for t in json.load(fh)["tickers"]]
     global _OLD_META_SPY, _PREV_GENERATED
@@ -1463,24 +1470,50 @@ def main():
     sec_ok = bool(tmap)
     if sec_err:
         print("SEC unavailable, using Yahoo fundamentals:", sec_err, file=sys.stderr)
-    try:
-        spy, _ = timed("SPY price", fetch_price, "SPY", _OLD_META_SPY, limit=45)
-    except Exception:  # noqa: BLE001
-        spy = None
+    full_run = not any(a.startswith("--") for a in argv)
+    spy = None
+    if full_run or not _OLD_META_SPY:
+        try:
+            spy, _ = timed("SPY price", fetch_price, "SPY", _OLD_META_SPY, limit=45)
+        except Exception:  # noqa: BLE001
+            spy = None
     market = market_direction(spy)
     meta = {"sec": "ok" if sec_ok else sec_err, "market": market, "spyPrice": spy,
             "spy": {k: spy.get(k) for k in ("last", "ret3m", "ret6m", "ret9m", "ret12m")} if spy else None,
             "weights": WEIGHTS}
 
-    out = {}
-    for sym in tickers:
+    if "--only" in argv:
+        targets = [x.strip().upper() for x in argv[argv.index("--only") + 1].split(",") if x.strip()]
+    elif "--new-only" in argv:
+        targets = [t for t in tickers if not (old.get(t) or {}).get("price")]
+    elif "--need-sec" in argv:
+        targets = [t for t in tickers if (old.get(t) or {}).get("quoteType") not in ("ETF", "MUTUALFUND")
+                   and ((old.get(t) or {}).get("fundamentals") or {}).get("source") != "SEC EDGAR"]
+    else:
+        targets = list(tickers)
+    partial = len(targets) < len(tickers) or any(a.startswith("--") for a in argv)
+    if not targets:
+        print("Nothing to do.")
+        return
+    print(f"Updating {len(targets)} of {len(tickers)}: {', '.join(targets)}")
+    if partial and old:
+        meta = dict(prev_all.get("meta") or meta)
+        market = meta.get("market") or market
+        spy = meta.get("spyPrice") or spy
+    skip_prices = os.environ.get("SKIP_PRICES") == "1"
+
+    out = {s: old[s] for s in tickers if s in old}
+    for sym in targets:
         prev = old.get(sym, {})
         rec = {"symbol": sym, "errors": {}}
         cik, name = tmap.get(sym) or (prev.get("cik"), prev.get("name"))
-        try:
-            price, err = timed(f"{sym} price", fetch_price, sym, prev.get("price"), limit=45)
-        except Exception as e:  # noqa: BLE001
-            price, err = None, str(e)
+        if skip_prices and prev.get("price"):
+            price, err = None, None  # keep the stored price; another job refreshes prices
+        else:
+            try:
+                price, err = timed(f"{sym} price", fetch_price, sym, prev.get("price"), limit=45)
+            except Exception as e:  # noqa: BLE001
+                price, err = None, str(e)
         qtype = prev.get("quoteType")
         if price:
             name = name or price.pop("_name", None)

@@ -13,7 +13,7 @@ cfg.weights = Object.assign({}, DEFAULT_WEIGHTS, cfg.weights || {});
 let J = readLS(J_KEY) || newJournal();
 let M = { generated: null, tickers: {} };   // market.json
 let LIST = [];                               // tickers.json entries
-const ui = { tab: "portfolio", sym: null, sub: "thesis", filter: "all", syncState: "" };
+const ui = { tab: "portfolio", sym: null, sub: "thesis", filter: "all", syncState: "", pending: {} };
 
 function newJournal() { return { version: 1, updated: null, holdings: {}, stocks: {}, extraTickers: [] }; }
 function readLS(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } }
@@ -133,6 +133,36 @@ async function push() {
     setSync("sync error"); console.warn(e);
   }
 }
+// After adding a stock: poll the repo directly (no Pages cache) until its data lands, then show it.
+async function fetchMarketFresh() {
+  const r = await fetch(`https://api.github.com/repos/${cfg.owner}/${cfg.appRepo}/contents/data/market.json`, {
+    headers: { Authorization: `Bearer ${cfg.token}`, Accept: "application/vnd.github.raw+json" }, cache: "no-store" });
+  if (!r.ok) throw new Error(`GitHub ${r.status}`);
+  return r.json();
+}
+async function waitForData(sym) {
+  ui.pending[sym] = "price"; render();
+  const start = Date.now();
+  while (Date.now() - start < 15 * 60 * 1000) {
+    await new Promise(res => setTimeout(res, ui.pending[sym] === "price" ? 15000 : 60000));
+    let data; try { data = await fetchMarketFresh(); } catch { continue; }
+    const t = data.tickers?.[sym];
+    if (!t?.price) continue;
+    M = data; applyWeights();
+    if (ui.pending[sym] === "price") { toast(`${sym} data is in`); ui.pending[sym] = "sec"; }
+    if (t.fundamentals?.source === "SEC EDGAR" || t.quoteType === "ETF") { delete ui.pending[sym]; render(); return; }
+    render();
+  }
+  delete ui.pending[sym]; render();
+}
+function pendingBanner(sym) {
+  const st = ui.pending[sym];
+  if (!st) return "";
+  return `<div class="flag ${st === "price" ? "" : "good"}" style="margin-bottom:12px;border-left-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,transparent)">${
+    st === "price" ? "Fetching price, chart, news and financials… usually about a minute. This page fills in by itself."
+      : "Preliminary data shown. Full SEC financials arrive within about 5 minutes if your Mac is awake (otherwise at its next run)."}</div>`;
+}
+
 async function addTickerRemote(sym) {
   // Commits the ticker to tickers.json in the app repo so the daily job starts fetching it.
   const f = await gh("GET", cfg.appRepo, "data/tickers.json");
@@ -269,7 +299,7 @@ function viewDetail(sym) {
   else if (ui.sub === "canslim") body = subCanslim(sym);
   else if (ui.sub === "journal") body = subJournal(sym, st);
   else body = subNews(r);
-  return `<div class="dhead"><div><div class="t2">${esc(r.name || "")}</div>
+  return `${pendingBanner(sym)}<div class="dhead"><div><div class="t2">${esc(r.name || "")}</div>
       <div class="price num">${p ? money(p.last) : "—"}</div>
       <div class="num ${cls(p?.change)}">${p ? `${p.change >= 0 ? "+" : "−"}${money(Math.abs(p.change))} (${pct(p.changePct)})` : "No price yet"} <span class="mute">${p ? fmtDate(p.asOf) : ""}</span></div></div>
       ${g ? `<div style="text-align:center" data-act="sub" data-v="health"><span class="grade lg ${gClass(g.letter)}">${g.letter}</span><div class="mute" style="font-size:11px">health ${g.score}</div></div>` : ""}</div>
@@ -590,7 +620,7 @@ async function doImport() {
   newSyms.forEach(s => { if (!J.extraTickers.includes(s)) J.extraTickers.push(s); });
   save(); closeSheet(); ui.tab = "portfolio"; ui.sym = null; render();
   toast(`Imported ${Object.keys(agg).length} positions`);
-  if (cfg.token) for (const s of newSyms) { try { await addTickerRemote(s); } catch (e) { console.warn(e); } }
+  if (cfg.token) for (const s of newSyms) { try { await addTickerRemote(s); waitForData(s); } catch (e) { console.warn(e); } }
 }
 
 // ------------------------------------------------------------ events
@@ -634,9 +664,12 @@ document.addEventListener("click", async e => {
   else if (a === "addTicker") {
     const s = (prompt("Ticker symbol (e.g. INTU)") || "").trim().toUpperCase(); if (!/^[A-Z.\-]{1,6}$/.test(s)) return;
     if (!J.extraTickers.includes(s)) J.extraTickers.push(s); stock(s); save();
-    if (cfg.token) { try { await addTickerRemote(s); toast(`${s} added — data arrives in a few minutes`); } catch (err) { toast("Saved here, but couldn't update the data list: " + err.message); } }
+    if (cfg.token) {
+      try { const added = await addTickerRemote(s); if (added !== false || !rec(s).price) waitForData(s); }
+      catch (err) { toast("Saved here, but couldn't update the data list: " + err.message); }
+    }
     else toast(`${s} added. Add a token in Settings so the daily job fetches its data.`);
-    ui.sym = s; ui.sub = "thesis"; render();
+    ui.sym = s; ui.sub = "thesis"; render(); scrollTo(0, 0);
   }
   else if (a === "saveTok") { cfg.token = document.getElementById("tok").value.trim(); writeLS(CFG_KEY, cfg); await pull(); const s2 = document.getElementById("sync2"); if (s2) s2.textContent = ui.syncState; }
   else if (a === "export") {
