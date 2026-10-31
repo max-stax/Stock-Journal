@@ -995,41 +995,50 @@ def letter(s):
 SPLITS = (2, 3, 4, 5, 8, 10, 15, 20, 25, 30, 40, 50)
 
 
-def _split_factor(latest, earlier):
-    """Return k if `earlier` share count looks like it's from before a k-for-1 split (or 1/k reverse)."""
-    if not latest or not earlier or earlier <= 0 or latest <= 0:
-        return None
-    r = latest / earlier
+def _split_k(ratio, tol=0.08):
     for k in SPLITS:
-        if abs(r / k - 1) < 0.15:
+        if abs(ratio / k - 1) < tol:
             return k
-        if abs(r * k - 1) < 0.15:
+        if abs(ratio * k - 1) < tol:
             return 1 / k
     return None
 
 
 def adjust_splits(raw):
-    """Filings before a stock split aren't restated. Put every period on today's share basis."""
+    """Filings before a stock split aren't restated. Detect splits year to year and put every
+    period on today's share basis. A split must show up in both the share count (x k) and EPS
+    (÷ k, roughly) in the same year; a share jump alone is treated as real dilution."""
     fy = raw["fy"]
-    latest = next((r.get("dilutedShares") for r in reversed(fy) if r.get("dilutedShares")), None)
-    notes = []
-    for row in fy[:-1]:
-        k = _split_factor(latest, row.get("dilutedShares"))
+    factors = [1.0] * len(fy)
+    years = []
+    for i in range(len(fy) - 1, 0, -1):
+        a, b = fy[i - 1], fy[i]
+        k = _split_k(b["dilutedShares"] / a["dilutedShares"]) \
+            if a.get("dilutedShares") and b.get("dilutedShares") else None
+        if k and a.get("eps") and b.get("eps") and a["eps"] * b["eps"] > 0:
+            eps_ratio = a["eps"] / b["eps"]  # ~k after a k-for-1 split
+            if not (k / 1.5 <= eps_ratio <= k * 1.5):
+                k = None
+        elif k and k < 3:
+            k = None  # small ratios without EPS confirmation are more likely issuance
         if k:
-            row["dilutedShares"] *= k
+            years.append(b["end"][:4])
+            for j2 in range(i):
+                factors[j2] *= k
+    for row, f in zip(fy, factors):
+        if f != 1.0:
+            if row.get("dilutedShares"):
+                row["dilutedShares"] *= f
             if row.get("eps") is not None:
-                row["eps"] /= k
-            notes.append(row["end"][:4])
-    for q in raw.get("quarters") or []:
-        if q.get("eps") and q.get("netIncome"):
-            k = _split_factor(latest, q["netIncome"] / q["eps"])
-            if k:
-                q["eps"] /= k
-    if raw.get("shares") and latest:
-        k = _split_factor(latest, raw["shares"])
-        if k and k < 1:  # shares-outstanding figure newer than the last annual report: leave it
-            pass
-    return f"Adjusted for a stock split (periods: {', '.join(notes)})" if notes else None
+                row["eps"] /= f
+    latest = next((r.get("dilutedShares") for r in reversed(fy) if r.get("dilutedShares")), None)
+    if years:
+        for q in raw.get("quarters") or []:
+            if q.get("eps") and q.get("netIncome"):
+                k = _split_k(latest / (q["netIncome"] / q["eps"]), tol=0.2) if latest else None
+                if k and k != 1:
+                    q["eps"] /= k
+    return f"Adjusted for a stock split in {', '.join(sorted(years))}" if years else None
 
 
 def analyze(raw, price):
@@ -1196,7 +1205,8 @@ def my_rules(price, f):
     if eg_q:
         cur, prev = eg_q
         ok = cur > prev
-        why = f"Latest quarter EPS {cur:.2f} vs {prev:.2f} a year ago."
+        dp = 3 if max(abs(cur), abs(prev)) < 0.1 else 2
+        why = f"Latest quarter EPS {cur:.{dp}f} vs {prev:.{dp}f} a year ago."
     elif fy and fy[-1].get("eps") is not None and len(fy) > 1 and fy[-2].get("eps") is not None:
         ok = fy[-1]["eps"] > fy[-2]["eps"]
         why = f"Yearly EPS {fy[-1]['eps']:.2f} vs {fy[-2]['eps']:.2f} the year before."
