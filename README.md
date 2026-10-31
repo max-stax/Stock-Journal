@@ -32,3 +32,13 @@ Tap **+ Add a stock** in the app (with a token set, it updates `data/tickers.jso
 - ETFs and funds (e.g. DRAM) have no SEC financials, so no grade.
 - Foreign companies that file in IFRS are supported where their filings include structured data; some won't.
 - The grade describes the business, not whether the stock is a good buy at today's price.
+
+## Running the data job on your Mac (recommended)
+
+SEC and Yahoo block GitHub's shared servers but not home connections, so the best data comes from running the job on your Mac. One-time setup — paste into Terminal:
+
+```
+bash <(curl -fsSL https://raw.githubusercontent.com/max-stax/Stock-Journal/main/scripts/setup-mac.sh)
+```
+
+It asks for your GitHub token and an email (SEC requires a contact email; it stays on the Mac), then runs every weekday at 5:30 PM, or when the Mac wakes if it was asleep. The GitHub job keeps running as a backup. Log: `~/Stock-Journal-data-job/last-run.log`.
