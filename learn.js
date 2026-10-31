@@ -122,6 +122,20 @@ const LEARN = {
     watch: "Distorted by one-off gains or losses, and meaningless when profit is tiny or negative.",
     say: c => c.pe != null ? `Investors pay $${c.pe.toFixed(0)} for every $1 of yearly profit.` : null,
   },
+  ruleSales: {
+    title: "Rule: under 2x sales",
+    what: "Your rule: buy only when the company's market value is less than twice its yearly revenue (price/sales under 2).",
+    read: "It forces you toward businesses the market hasn't priced for perfection, so a good quarter can still move the stock up instead of merely meeting expectations.",
+    watch: "Many high-quality, high-margin companies never trade under 2x sales. Your rules allow exceptions; when you make one, note in the thesis what justifies paying more (very high margins, fast profitable growth).",
+    say: c => c.ps != null ? `${c.name} trades at ${c.ps.toFixed(1)}x sales${c.ps < 2 ? ", inside your limit." : ", above your limit of 2."}` : null,
+  },
+  ruleChart: {
+    title: "Rule: sideways or slightly up chart",
+    what: "Your rule: prefer stocks that have been moving sideways or drifting slightly up, not ones going straight up (chasing) or straight down (catching a falling knife).",
+    read: "The app looks at the last ~6 months. Sideways = within about −10% to +5% and near its 200-day average. Slightly up = +5% to +25%, not stretched far above the 200-day average. More than +40% in 6 months or 30%+ above the 200-day counts as straight up; −20% or worse, or 15%+ below the 200-day, counts as straight down.",
+    watch: "These thresholds are a starting point, not a law. Look at the chart itself before deciding.",
+    say: () => null,
+  },
   balanceSheet: {
     title: "The balance sheet",
     what: "A snapshot of what the company owns (assets), what it owes (liabilities), and what's left over for shareholders (equity) on one date. It always balances: Assets = Liabilities + Equity.",

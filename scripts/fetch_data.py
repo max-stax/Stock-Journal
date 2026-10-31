@@ -992,7 +992,48 @@ def letter(s):
     return "A" if s >= 80 else "B" if s >= 65 else "C" if s >= 50 else "D" if s >= 35 else "F"
 
 
+SPLITS = (2, 3, 4, 5, 8, 10, 15, 20, 25, 30, 40, 50)
+
+
+def _split_factor(latest, earlier):
+    """Return k if `earlier` share count looks like it's from before a k-for-1 split (or 1/k reverse)."""
+    if not latest or not earlier or earlier <= 0 or latest <= 0:
+        return None
+    r = latest / earlier
+    for k in SPLITS:
+        if abs(r / k - 1) < 0.15:
+            return k
+        if abs(r * k - 1) < 0.15:
+            return 1 / k
+    return None
+
+
+def adjust_splits(raw):
+    """Filings before a stock split aren't restated. Put every period on today's share basis."""
+    fy = raw["fy"]
+    latest = next((r.get("dilutedShares") for r in reversed(fy) if r.get("dilutedShares")), None)
+    notes = []
+    for row in fy[:-1]:
+        k = _split_factor(latest, row.get("dilutedShares"))
+        if k:
+            row["dilutedShares"] *= k
+            if row.get("eps") is not None:
+                row["eps"] /= k
+            notes.append(row["end"][:4])
+    for q in raw.get("quarters") or []:
+        if q.get("eps") and q.get("netIncome"):
+            k = _split_factor(latest, q["netIncome"] / q["eps"])
+            if k:
+                q["eps"] /= k
+    if raw.get("shares") and latest:
+        k = _split_factor(latest, raw["shares"])
+        if k and k < 1:  # shares-outstanding figure newer than the last annual report: leave it
+            pass
+    return f"Adjusted for a stock split (periods: {', '.join(notes)})" if notes else None
+
+
 def analyze(raw, price):
+    split_note = adjust_splits(raw)
     fy = raw["fy"]
     prev = None
     for row in fy:
@@ -1042,6 +1083,7 @@ def analyze(raw, price):
 
     snap = {**t, "shareChange": fy[-1].get("shareChange")}
     out = {"source": raw["source"], "currency": raw["currency"], "fy": fy, "ttm": t, "balance": latest,
+           "splitNote": split_note,
            "quarters": raw["quarters"], "valuation": {"sharesOutstanding": shares}}
     out["grade"] = grade(snap, latest, bvps_g)
     out["grade"]["asOf"] = t.get("asOf")

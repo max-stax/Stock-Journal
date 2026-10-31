@@ -247,7 +247,7 @@ function viewStocks() {
       return `<div class="row" data-act="open" data-v="${s}">
         <div><div class="sym">${s} <span class="grade ${gClass(g?.letter)}" title="Health grade">${g?.letter || "–"}</span>
           ${st?.status === "owned" ? `<span class="chip owned">owned</span>` : ""}${reviewDue(st) ? `<span class="chip due">review</span>` : ""}</div>
-          <div class="sub">${esc(shortName(r.name) || "")}${r.canslim ? ` · CAN SLIM ${["C","A","N","S","L","I","M"].filter(k => r.canslim[k]?.pass === true).length}/7` : ""}${hasThesis ? "" : ` · <span class="t2">no thesis yet</span>`}</div></div>
+          <div class="sub">${esc(shortName(r.name) || "")}${r.rules ? ` · rules ${ruleCount(r)[0]}/${ruleCount(r)[1]}` : ""}${r.canslim ? ` · CAN SLIM ${["C","A","N","S","L","I","M"].filter(k => r.canslim[k]?.pass === true).length}/7` : ""}${hasThesis ? "" : ` · <span class="t2">no thesis yet</span>`}</div></div>
         <div class="right"><div class="num">${r.price ? money(r.price.last) : "—"}</div><div class="sub num ${cls(r.price?.changePct)}">${pct(r.price?.changePct)}</div></div></div>`;
     }).join("") || `<div class="empty">Nothing here.</div>`}</div></div>
     <button class="btn ghost block" data-act="addTicker">+ Add a stock</button>`;
@@ -261,7 +261,7 @@ function kvRow(label, val, key, sym, valCls = "") {
 
 function viewDetail(sym) {
   const r = rec(sym), st = stock(sym), p = r.price, h = J.holdings[sym], co = callout(sym), g = r.fundamentals?.grade;
-  const subs = [["thesis", "Thesis"], ["health", "Health"], ["canslim", "CAN SLIM"], ["numbers", "Numbers"], ["journal", "Journal"], ["news", "News"]];
+  const subs = [["thesis", "Thesis"], ["health", "Health"], ["canslim", "Rules"], ["numbers", "Numbers"], ["journal", "Journal"], ["news", "News"]];
   let body = "";
   if (ui.sub === "thesis") body = subThesis(sym, st, co);
   else if (ui.sub === "health") body = subHealth(sym);
@@ -384,7 +384,7 @@ function subNumbers(sym) {
       ${row("Net cash", "netCash", x => money(x.netCash))}
       ${row("Liab. ÷ assets", "liabToAssets", x => pct(x.liabToAssets, 0, false))}
       ${row("Equity/share", "bvpsGrowth", x => pct(x.bvpsGrowth, 0))}
-      </tbody></table></div><p class="mute" style="font-size:12px;margin:8px 0 0">Source: ${esc(f.source || "SEC filings")}${f.currency && f.currency !== "USD" ? ` (in ${f.currency})` : ""}.</p></div>`;
+      </tbody></table></div><p class="mute" style="font-size:12px;margin:8px 0 0">Source: ${esc(f.source || "SEC filings")}${f.splitNote ? ". " + esc(f.splitNote) : ""}${f.currency && f.currency !== "USD" ? ` (in ${f.currency})` : ""}.</p></div>`;
 }
 
 function aleBar(b) {
@@ -404,18 +404,32 @@ function balanceChecks(checks) {
     <span style="flex:1">${esc(c.label)} ${learnQ(c.key)}</span><span class="mute">${esc(c.text)}</span></div>`).join("")}</div>`;
 }
 
+const RULE_ORDER = ["sales", "cash", "revenue", "earnings", "chart"];
+const RULE_LEARN = { sales: "ruleSales", cash: "netCash", revenue: "growth", earnings: "eps", chart: "ruleChart" };
+function ruleCount(r) { const x = r.rules || {}; return [RULE_ORDER.filter(k => x[k]?.pass === true).length, RULE_ORDER.filter(k => x[k]?.pass != null).length]; }
+function myRulesCard(sym) {
+  const r = rec(sym), R = r.rules; if (!R) return "";
+  const [p, n] = ruleCount(r);
+  return `<div class="card"><h2>My rules<span class="sp"></span><span class="num" style="text-transform:none;letter-spacing:0;color:var(--text)">${p} / ${n} pass</span></h2>
+    ${RULE_ORDER.map(k => { const x = R[k] || {}; const st = x.pass === true ? "pos" : x.pass === false ? "neg" : "mute";
+      return `<div class="part" style="grid-template-columns:1fr auto"><div>${esc(x.name || k)} ${learnQ(RULE_LEARN[k])}</div>
+        <div class="${st}" style="font-weight:600">${x.pass === true ? "Pass" : x.pass === false ? "Fail" : "—"}</div><div class="why">${esc(x.why || "")}</div></div>`; }).join("")}
+    ${R.chart ? `<div style="margin-top:8px">${spark((r.price?.history || []).slice(-27), 320, 44)}<div class="mute" style="font-size:11.5px">Last 6 months${r.price?.approxHistory ? " · averages estimated from weekly data until daily history builds up" : ""}</div></div>` : ""}
+    <p class="mute" style="font-size:12px;margin:8px 0 0">Exceptions happen. If you buy one that fails a rule, write why in the thesis.</p></div>`;
+}
+
 function subCanslim(sym) {
   const r = rec(sym), cs = r.canslim, mk = M.meta?.market;
-  if (!cs) return `<div class="card empty">${r.quoteType === "ETF" ? "CAN SLIM applies to individual companies, not ETFs." : "No CAN SLIM data yet. It appears after the next daily update."}</div>`;
+  if (!cs) return `<div class="card empty">${r.quoteType === "ETF" ? "These checklists apply to individual companies, not ETFs." : "No checklist data yet. It appears after the next daily update."}</div>`;
   const order = ["C", "A", "N", "S", "L", "I", "M"], passed = order.filter(k => cs[k]?.pass === true).length;
   const known = order.filter(k => cs[k]?.pass != null).length;
-  return `<div class="card"><h2>CAN SLIM ${learnQ("canslim")}<span class="sp"></span><span class="num" style="text-transform:none;letter-spacing:0;color:var(--text)">${passed} / ${known} pass</span></h2>
+  return `${myRulesCard(sym)}<div class="card"><h2>CAN SLIM ${learnQ("canslim")}<span class="sp"></span><span class="num" style="text-transform:none;letter-spacing:0;color:var(--text)">${passed} / ${known} pass</span></h2>
     ${order.map(k => { const x = cs[k] || {}; const st = x.pass === true ? "pos" : x.pass === false ? "neg" : "mute";
       return `<div class="part" style="grid-template-columns:auto 1fr auto"><span class="grade" style="background:var(--${st === "mute" ? "panel-2" : st});color:${st === "mute" ? "var(--mute)" : "#0b0d0f"}">${k}</span>
         <div>${esc(x.name || k)} ${learnQ("cs" + k)}</div><div class="${st}" style="font-weight:600">${x.pass === true ? "Pass" : x.pass === false ? "Fail" : "—"}</div>
         <div class="why">${esc(x.why || "")}</div></div>`; }).join("")}
     <p class="mute" style="font-size:12px;margin:8px 0 0">L is an approximation of IBD's Relative Strength rating (compares to the S&P 500, not every stock). I's change builds up over time from daily snapshots.</p></div>
-    ${mk ? `<div class="card"><h2>Market (M)</h2><div class="kv">${kvRow("S&P 500", money(mk.spy))}${kvRow("50-day average", money(mk.ma50))}${kvRow("200-day average", money(mk.ma200))}</div></div>` : ""}
+    ${mk ? `<div class="card"><h2>Market (M)</h2><div class="kv">${kvRow("S&P 500 (SPY)", money(mk.spy))}${kvRow("50-day average", money(mk.ma50))}${kvRow("200-day average", money(mk.ma200))}</div></div>` : ""}
     <div class="card"><h2>How CAN SLIM and the health grade differ</h2><p class="t2" style="margin:0">The health grade asks “is this a sound business?” CAN SLIM asks “is this the right stock to buy now?” A stock can score A on health and fail CAN SLIM (great business, weak price action), or the reverse. O'Neil also cuts any loss at 7–8% — write in your thesis which rulebook governs this position.</p></div>`;
 }
 
@@ -442,7 +456,7 @@ function viewLearn() {
     <label class="stack" style="margin:0"><input type="checkbox" data-act="toggleLearn" ${cfg.learn ? "checked" : ""}> Show one-line explanations under each number</label></div>
     ${[["Reading the business", ["revenue", "growth", "grossMargin", "operatingMargin", "netIncome", "eps"]], ["Cash", ["fcf", "fcfMargin", "sbc"]],
       ["Balance sheet", ["balanceSheet", "totalAssets", "totalLiabilities", "equity", "liabToAssets", "netCash", "currentRatio", "intangibleShare", "bvpsGrowth", "debtToEquity", "shareChange"]],
-      ["Valuation", ["marketCap", "priceToSales", "evToSales", "priceToFcf", "pe", "priceToBook"]], ["CAN SLIM", ["canslim", "csC", "csA", "csN", "csS", "csL", "csI", "csM", "eps", "roe"]],
+      ["My rules", ["ruleSales", "netCash", "growth", "eps", "ruleChart"]], ["Valuation", ["marketCap", "priceToSales", "evToSales", "priceToFcf", "pe", "priceToBook"]], ["CAN SLIM", ["canslim", "csC", "csA", "csN", "csS", "csL", "csI", "csM", "eps", "roe"]],
       ["This app", ["grade", "gradeVsPrice", "ttm"]]]
       .map(([h, keys]) => `<div class="card"><h2>${h}</h2><div class="rows">${keys.map(k => `<div class="row" data-act="learn" data-v="${k}"><div><div>${LEARN[k].title}</div><div class="sub">${esc(LEARN[k].what)}</div></div><div class="mute">›</div></div>`).join("")}</div></div>`).join("")}`;
 }

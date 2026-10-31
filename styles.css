@@ -45,6 +45,7 @@ main { max-width: 720px; margin: 0 auto; padding: 14px 16px 24px; }
 .rows { display: flex; flex-direction: column; }
 .row { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; padding: 11px 2px; border-bottom: 1px solid var(--line); cursor: pointer; }
 .row:last-child { border-bottom: 0; }
+.row > div:first-child { min-width: 0; }
 .row:active { background: var(--panel-2); }
 .sym { font-weight: 650; font-size: 15.5px; display: flex; align-items: center; gap: 8px; }
 .sub { font-size: 12.5px; color: var(--mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
